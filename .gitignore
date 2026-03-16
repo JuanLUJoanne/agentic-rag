@@ -12,3 +12,4 @@ data/embedding_cache.db
 dist/
 build/
 .ruff_cache/
+.venv/

@@ -192,5 +192,76 @@ async def main() -> None:
     print(_DIV)
 
 
+def _run_finetuning_demo() -> None:
+    """Standalone fine-tuning demo — safe to run without GPU."""
+    print("\n" + "=" * 60)
+    print("FINE-TUNING DEMO")
+    print("=" * 60)
+
+    from src.finetuning.embedding_ft import EmbeddingFineTuner
+    from src.finetuning.qlora_dpo import QAExample, QLoRADPOTrainer
+
+    # ── Embedding fine-tuning ─────────────────────────────────────────────────
+    print("\n--- Embedding Fine-Tuning ---")
+    emb_ft = EmbeddingFineTuner()
+    queries = [
+        "What is retrieval augmented generation?",
+        "How does vector search work?",
+        "Explain BM25 scoring",
+    ]
+    corpus = [
+        "RAG combines document retrieval with language model generation for grounded answers.",
+        "Vector search uses embedding similarity to find semantically related documents.",
+        "BM25 is a probabilistic ranking function based on term frequency and document length.",
+        "Kubernetes orchestrates containerized applications across clusters.",
+        "Python is a high-level programming language used in data science.",
+    ]
+    relevance = {"0": [0], "1": [1], "2": [2]}
+
+    triples = emb_ft.prepare_data(queries, corpus, relevance)
+    print(f"  Prepared {len(triples)} training triples")
+    train_result = emb_ft.train(triples, output_dir="/tmp/demo_embedding")
+    print(f"  Training: {train_result}")
+    eval_result = emb_ft.evaluate(triples[:2])
+    print(f"  Eval: recall@5={eval_result['recall@5']:.2f}, MRR@10={eval_result['mrr@10']:.2f}")
+
+    # ── QLoRA + DPO ───────────────────────────────────────────────────────────
+    print("\n--- QLoRA + DPO Fine-Tuning ---")
+    trainer = QLoRADPOTrainer()
+    qa_examples = [
+        QAExample(
+            context="RAG combines retrieval with generation.",
+            question="What is RAG?",
+            answer="RAG retrieves relevant documents then generates answers grounded in those documents.",
+        ),
+        QAExample(
+            context="BM25 uses term frequency and inverse document frequency.",
+            question="How does BM25 rank documents?",
+            answer="BM25 scores documents by term frequency, inverse document frequency, and document length normalization.",
+        ),
+        QAExample(
+            context="DPO aligns models with human preferences without a reward model.",
+            question="What is DPO?",
+            answer="Direct Preference Optimization trains models on preference pairs, avoiding the complexity of RLHF reward models.",
+        ),
+    ]
+
+    qlora_result = trainer.train_qlora(qa_examples, output_dir="/tmp/demo_qlora")
+    print(f"  QLoRA: {qlora_result}")
+    dpo_pairs = trainer.generate_dpo_pairs(qa_examples)
+    print(f"  Generated {len(dpo_pairs)} DPO pairs")
+    dpo_result = trainer.train_dpo(dpo_pairs, output_dir="/tmp/demo_dpo")
+    print(f"  DPO: {dpo_result}")
+    eval_result = trainer.evaluate(qa_examples)
+    print(f"  Base accuracy:        {eval_result['base_accuracy']:.0%}")
+    print(f"  QLoRA accuracy:       {eval_result['qlora_accuracy']:.0%}")
+    print(f"  DPO accuracy:         {eval_result['dpo_accuracy']:.0%}")
+    print(
+        f"  Hallucination: {eval_result['base_hallucination_rate']:.0%} "
+        f"→ {eval_result['dpo_hallucination_rate']:.0%}"
+    )
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+    _run_finetuning_demo()

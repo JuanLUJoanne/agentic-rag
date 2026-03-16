@@ -128,6 +128,18 @@ Both fine-tuning pipelines have complete interfaces, docstrings, and mock implem
 - Stage 2 DPO: preference alignment without a reward model (3–5× cheaper than RLHF)
 - Expected: **+15% domain QA accuracy** (QLoRA), **–44% hallucination rate** (DPO: 18% → 10%)
 
+### Running fine-tuning locally
+
+```bash
+# Install fine-tuning dependencies (peft, trl, bitsandbytes, accelerate)
+pip install -e ".[finetune]"
+
+# Run the demo (works without GPU — uses TinyLlama + MiniLM on CPU)
+python scripts/demo.py
+```
+
+The fine-tuning modules gracefully degrade: without GPU dependencies installed, all methods return mock metrics so the rest of the system (evaluation, drift detection, A/B comparison) works end-to-end.
+
 ---
 
 ## Quick Start
