@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/cache.db
+data/audit.jsonl
+data/drift_baselines.json
+data/query_memory.db
+data/embedding_cache.db
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.ruff_cache/
