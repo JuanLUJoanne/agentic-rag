@@ -103,6 +103,7 @@ print(report.winner)
 | Rate limiting | `gateway/rate_limiter.py` | Token-bucket per model; `on_429` halves rate for 60 s |
 | Cost guardrails | `gateway/guardrails.py` | Per-request, per-query, anomaly (3× rolling avg), total budget |
 | Security | `gateway/security.py` | Prompt injection detection; PII redaction (email, phone, card) |
+| PII compliance | `gateway/pii_detector.py` | 3-layer PII pipeline: ingestion scan → pre-LLM redaction → output scan |
 | Retrieval cache | `retrieval/cache.py` | SQLite, SHA-256 key, TTL expiry |
 | Answer memory | `retrieval/memory.py` | Faithfulness gate (≥ 0.85); SQLite-backed |
 | Drift detection | `eval/drift_detector.py` | JSON baselines; alerts when metric drops > 5 pp |
@@ -127,6 +128,33 @@ Both fine-tuning pipelines have complete interfaces, docstrings, and mock implem
 - Stage 1 QLoRA: 4-bit NF4 quantisation + LoRA adapters (~0.5% trainable params, fits 7B in 6 GB VRAM)
 - Stage 2 DPO: preference alignment without a reward model (3–5× cheaper than RLHF)
 - Expected: **+15% domain QA accuracy** (QLoRA), **–44% hallucination rate** (DPO: 18% → 10%)
+
+## PII Compliance
+
+Three-layer pipeline ensuring personal data never reaches external APIs unredacted:
+
+| Layer | Where | What it catches |
+|-------|-------|-----------------|
+| **1 — Detection** | `gateway/pii_detector.py` | EMAIL, PHONE, CREDIT_CARD, IP_ADDRESS, PERSON, LOCATION, DATE_OF_BIRTH, AU_MEDICARE, AU_TFN, AU_ABN |
+| **2 — Pre-LLM guard** | `gateway/guardrails.py` `PIIGuardrail` | Scans full prompt (system + user + context chunks) before any LLM API call; redacts or blocks |
+| **3 — Output scan** | `gateway/output_scanner.py` `OutputScanner` | Scans generated text after the LLM returns; catches context leakage and hallucinated PII |
+
+**Detection backends** (with graceful degradation):
+- **Presidio + spaCy** (`pip install -e ".[pii]"` then `python -m spacy download en_core_web_lg`) — NER-based detection for PERSON, LOCATION, DATE_OF_BIRTH plus all regex types
+- **Regex fallback** (always active, zero extra deps) — EMAIL, PHONE, CREDIT_CARD, IP_ADDRESS, AU identifiers, and a PERSON heuristic (Title-Case word pairs)
+
+**Compliance audit trail**: every PII event is appended to `data/audit.jsonl` with `event_type`, `pii_types`, `pii_count`, `action_taken`.  Query the report endpoint:
+
+```bash
+GET /compliance/pii-report?hours=24
+```
+
+**Strict mode** — for high-compliance environments (healthcare, legal):
+```python
+guard = PIIGuardrail(strict_mode=True)  # block instead of redact
+```
+
+---
 
 ### Running fine-tuning locally
 

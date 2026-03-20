@@ -34,9 +34,15 @@ peft = {version = ">=0.9.0", optional = true}
 trl = {version = ">=0.8.0", optional = true}
 bitsandbytes = {version = ">=0.42.0", optional = true}
 accelerate = {version = ">=0.27.0", optional = true}
+# Optional PII deps — install with: pip install -e ".[pii]"
+# then: python -m spacy download en_core_web_lg
+presidio-analyzer = {version = ">=2.2.0", optional = true}
+presidio-anonymizer = {version = ">=2.2.0", optional = true}
+spacy = {version = ">=3.0.0", optional = true}
 
 [tool.poetry.extras]
 finetune = ["sentence-transformers", "peft", "trl", "bitsandbytes", "accelerate"]
+pii = ["presidio-analyzer", "presidio-anonymizer", "spacy"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0"

@@ -6,11 +6,15 @@ POST /query/stream   SSE stream of workflow events
 GET  /health         liveness probe
 GET  /costs          cost summary by model
 GET  /eval/drift     latest drift report (auto-saved baseline on first call)
+GET  /compliance/pii-report   PII detection statistics from the audit log
 /review/*            human-in-the-loop review queue (see human_review.py)
 """
 from __future__ import annotations
 
+import json
 import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 import structlog
@@ -186,6 +190,70 @@ async def eval_drift_endpoint() -> dict:
         "degraded_dimensions": report.degraded_dimensions,
         "current_scores": report.current_scores,
         "per_dimension_deltas": report.per_dimension_deltas,
+    }
+
+
+@app.get("/compliance/pii-report")
+async def pii_report_endpoint(hours: int = 24) -> dict:
+    """
+    Return PII detection statistics aggregated from the audit log.
+
+    Reads all entries in ``data/audit.jsonl`` that have an ``event_type``
+    field (i.e. PII compliance events) and fall within the requested time
+    window.  Returns counts by PII type, by detection layer, and the total
+    number of PII instances redacted.
+
+    Query parameters
+    ----------------
+    hours: int
+        How far back to look (default 24 h).
+    """
+    audit_path = Path("data/audit.jsonl")
+    empty: dict = {
+        "total_pii_detected": 0,
+        "by_type": {},
+        "by_layer": {},
+        "period_hours": hours,
+    }
+
+    if not audit_path.exists():
+        return empty
+
+    cutoff = datetime.now(UTC) - timedelta(hours=hours)
+    total = 0
+    by_type: dict[str, int] = {}
+    by_layer: dict[str, int] = {}
+
+    try:
+        with audit_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "event_type" not in entry:
+                    continue
+                ts = datetime.fromisoformat(entry["timestamp"])
+                if ts < cutoff:
+                    continue
+                pii_count = entry.get("pii_count", 0)
+                total += pii_count
+                for t in entry.get("pii_types", []):
+                    by_type[t] = by_type.get(t, 0) + pii_count
+                evt = entry["event_type"]
+                by_layer[evt] = by_layer.get(evt, 0) + 1
+    except OSError as exc:
+        logger.warning("pii_report_read_failed", reason=str(exc))
+        return empty
+
+    return {
+        "total_pii_detected": total,
+        "by_type": by_type,
+        "by_layer": by_layer,
+        "period_hours": hours,
     }
 
 

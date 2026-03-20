@@ -161,3 +161,44 @@ class AuditLogger:
             cost=cost,
             agents=len(agents_used),
         )
+
+    def log_pii_event(
+        self,
+        *,
+        event_type: str,
+        query_id: str | None = None,
+        pii_types: list[str],
+        pii_count: int,
+        action_taken: str,
+        redaction_style: str = "placeholder",
+    ) -> None:
+        """
+        Append a PII-specific compliance event to the audit log.
+
+        ``event_type`` should be one of:
+          - ``pii_detected_ingestion``   — PII found in raw user input
+          - ``pii_redacted_pre_llm``     — PII redacted before LLM call
+          - ``pii_found_in_output``      — PII detected in LLM response
+          - ``pii_detection_failed``     — detector error (log and continue)
+
+        Each entry includes: timestamp, query_id, pii_types, pii_count,
+        action_taken, and redaction_style for compliance reporting.
+        """
+        entry = {
+            "event_id": str(uuid.uuid4()),
+            "timestamp": datetime.now(UTC).isoformat(),
+            "query_id": query_id or str(uuid.uuid4()),
+            "event_type": event_type,
+            "pii_types": pii_types,
+            "pii_count": pii_count,
+            "action_taken": action_taken,
+            "redaction_style": redaction_style,
+        }
+        with self._path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+        logger.info(
+            "pii_audit_logged",
+            event_type=event_type,
+            pii_count=pii_count,
+            query_id=entry["query_id"],
+        )

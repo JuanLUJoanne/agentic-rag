@@ -194,3 +194,129 @@ class InputGuardrail:
             return GuardrailResult(allowed=False, reason=reason)
 
         return GuardrailResult(allowed=True, reason="ok")
+
+
+# ── PII Guardrail ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class PIIGuardrailResult:
+    """
+    Result returned by :class:`PIIGuardrail`.
+
+    Extends the basic allow/reason pair with PII-specific fields so callers
+    can inspect what was found and use the redacted prompt directly.
+    """
+
+    allowed: bool
+    reason: str
+    redacted_text: str    # prompt with PII replaced (use this for LLM calls)
+    pii_count: int        # total number of PII spans detected
+    pii_types: list[str]  # unique entity types found, e.g. ["EMAIL", "PERSON"]
+
+    def __bool__(self) -> bool:
+        return self.allowed
+
+
+class PIIGuardrail:
+    """
+    Pre-LLM PII scan and redaction guardrail.
+
+    Scans the full prompt (system message + user query + retrieved context
+    chunks concatenated) for PII **before** it is sent to any LLM API.
+
+    Two modes
+    ---------
+    ``strict_mode=False`` (default):
+        Redact PII and continue.  The LLM receives a clean prompt and the
+        audit log records what was found.  Choose this for most deployments
+        where blocking the query would degrade UX.
+
+    ``strict_mode=True``:
+        Block the request entirely if any PII is detected.  The caller must
+        handle the ``not allowed`` result and return an error to the user.
+        Use this for high-compliance environments (legal, healthcare) where
+        PII must never reach an external API.
+
+    Parameters
+    ----------
+    strict_mode:
+        Whether to block (True) or redact-and-continue (False).
+    audit_logger:
+        Optional :class:`~src.gateway.security.AuditLogger` instance.
+        When provided, every PII detection event is appended to the audit log.
+    confidence_threshold:
+        Forwarded to the underlying :class:`PIIDetector`.
+    allow_list:
+        Forwarded to the underlying :class:`PIIDetector`.
+    """
+
+    def __init__(
+        self,
+        strict_mode: bool = False,
+        audit_logger=None,  # AuditLogger | None — forward reference avoids circular import
+        confidence_threshold: float = 0.7,
+        allow_list: list[str] | None = None,
+    ) -> None:
+        self._strict = strict_mode
+        self._audit = audit_logger
+
+        # Lazy import to keep guardrails.py importable when pii_detector has issues
+        from src.gateway.pii_detector import PIIDetector
+
+        self._detector = PIIDetector(
+            confidence_threshold=confidence_threshold,
+            allow_list=allow_list,
+        )
+
+    def check(
+        self,
+        prompt: str,
+        query_id: str | None = None,
+    ) -> PIIGuardrailResult:
+        """
+        Scan ``prompt`` for PII.
+
+        Returns a :class:`PIIGuardrailResult` whose ``redacted_text`` should
+        replace the original prompt in all downstream LLM calls — regardless
+        of whether the result is ``allowed`` or not — so that any incidentally
+        detected PII is never sent onward.
+        """
+        redacted, entities = self._detector.redact(prompt)
+        pii_types = sorted({e.entity_type for e in entities})
+
+        if entities and self._audit is not None:
+            try:
+                action = "blocked" if self._strict else "redacted"
+                self._audit.log_pii_event(
+                    event_type="pii_redacted_pre_llm",
+                    query_id=query_id,
+                    pii_types=pii_types,
+                    pii_count=len(entities),
+                    action_taken=action,
+                )
+            except Exception as exc:
+                logger.warning("pii_guardrail_audit_failed", reason=str(exc)[:80])
+
+        if entities and self._strict:
+            reason = f"strict_mode: PII detected ({', '.join(pii_types)})"
+            logger.warning(
+                "pii_guardrail_blocked",
+                query_id=query_id,
+                pii_types=pii_types,
+            )
+            return PIIGuardrailResult(
+                allowed=False,
+                reason=reason,
+                redacted_text=redacted,
+                pii_count=len(entities),
+                pii_types=pii_types,
+            )
+
+        return PIIGuardrailResult(
+            allowed=True,
+            reason="ok" if not entities else "pii_redacted",
+            redacted_text=redacted,
+            pii_count=len(entities),
+            pii_types=pii_types,
+        )
