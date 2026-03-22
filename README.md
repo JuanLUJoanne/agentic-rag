@@ -18,6 +18,9 @@ InputSanitizer ──[injection]──► Error response
 QueryMemory ────[cache hit]──► Cached answer ──► AuditLog ──► SSE stream
     │ miss
     ▼
+SemanticCache ──[hit ≥ 0.95]► Cached answer ──► AuditLog ──► SSE stream
+    │ miss
+    ▼
 QueryRouter ────[simple]────► Corrective RAG pipeline
     │ complex/ambiguous
     ▼
@@ -105,6 +108,7 @@ print(report.winner)
 | Security | `gateway/security.py` | Prompt injection detection; PII redaction (email, phone, card) |
 | PII compliance | `gateway/pii_detector.py` | 3-layer PII pipeline: ingestion scan → pre-LLM redaction → output scan |
 | Retrieval cache | `retrieval/cache.py` | SQLite, SHA-256 key, TTL expiry |
+| Semantic cache | `retrieval/semantic_cache.py` | Cosine similarity ≥ 0.95; FAISS or numpy backend; TTL + faithfulness gate |
 | Answer memory | `retrieval/memory.py` | Faithfulness gate (≥ 0.85); SQLite-backed |
 | Drift detection | `eval/drift_detector.py` | JSON baselines; alerts when metric drops > 5 pp |
 | Human review | `api/human_review.py` | In-memory queue; approve stores to memory |
