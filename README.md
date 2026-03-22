@@ -54,7 +54,7 @@ Corrective RAG:
 | 7 | **Prompt Chaining** | `simple_workflow.py` | Three-step chain: classify → retrieve → grade → rewrite → generate → verify |
 | 8 | **Routing** | `query_router.py` | Heuristic classifier (no LLM cost) routes to simple Corrective RAG or multi-agent supervisor |
 | 9 | **Parallelization** | `parallel_retriever.py` | BM25, dense, and graph retrievers run concurrently via `asyncio.gather`; results merged with Reciprocal Rank Fusion |
-| 10 | **Memory** | `cache.py`, `memory.py` | Two-layer: `EmbeddingCache` (TTL, sha256 key) for vector lookups; `QueryMemory` (faithfulness gate ≥ 0.85) for full answers |
+| 10 | **Memory** | `cache.py`, `memory.py`, `semantic_cache.py` | Three-layer: `EmbeddingCache` (SHA-256 key, TTL, SQLite) for retrieval results; `SemanticCache` (cosine similarity ≥ 0.95, FAISS/numpy) for full answers; `QueryMemory` (exact match, faithfulness gate ≥ 0.85) for full answers |
 
 ---
 
