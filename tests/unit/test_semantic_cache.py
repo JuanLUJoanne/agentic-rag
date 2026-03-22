@@ -20,7 +20,6 @@ from src.retrieval.semantic_cache import (
     get_default_semantic_cache,
 )
 
-
 # ── Test helpers ──────────────────────────────────────────────────────────────
 
 
@@ -133,7 +132,6 @@ async def test_faithfulness_gate_stores_high_score() -> None:
 async def test_precomputed_embedding_reused() -> None:
     """Passing a precomputed embedding bypasses _encode."""
     cache = _make_test_cache(similarity_threshold=0.95)
-    dim = 4
     vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     await cache.set("test query", "answer", [], eval_score=0.9, embedding=vec)
