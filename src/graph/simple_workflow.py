@@ -10,9 +10,9 @@ Batch 4 adds production hardening:
   - audit_log (new terminal node): appends a JSONL audit record after finalize.
 
 Graph topology:
-  sanitize_input ──► memory_check ──► query_router → query_analyzer → retrieve → grade_documents
-       │ injection          │ hit             ↓ all_relevant              ↑ rewrite loops back
-       └──► finalize        └──► finalize gate_generate ◄── partial/rewrite ┘
+  sanitize_input ──► memory_check ──► semantic_cache_check ──► query_router → query_analyzer → retrieve → grade_documents
+       │ injection          │ hit             │ hit                    ↓ all_relevant              ↑ rewrite loops back
+       └──► finalize        └──► finalize     └──► finalize gate_generate ◄── partial/rewrite ┘
                                       │     ↑ web_search feeds in on none
                                       │     check_hallucination
                                       │     ↓ grounded    ↓ hallucinated (retry ≤ max_retries)
@@ -44,6 +44,7 @@ from src.gateway.rate_limiter import get_default_rate_limiter
 from src.gateway.security import AuditLogger, InputSanitizer, PromptInjectionDetected
 from src.graph.state import AgentState
 from src.retrieval.memory import get_default_memory
+from src.retrieval.semantic_cache import get_default_semantic_cache
 from src.utils.llm import DummyLLM, get_llm
 
 logger = structlog.get_logger()
@@ -145,8 +146,53 @@ async def memory_check(state: AgentState) -> dict:
 
 def route_after_memory_check(
     state: AgentState,
+) -> Literal["finalize", "semantic_cache_check"]:
+    """Route to finalize on cache hit, otherwise try the semantic cache."""
+    return "finalize" if state.get("final_answer") else "semantic_cache_check"
+
+
+# ── Semantic cache check node ──────────────────────────────────────────────────
+
+
+async def semantic_cache_check(state: AgentState) -> dict:
+    """
+    LangGraph node: check the semantic cache before running full RAG.
+
+    Accepts a pre-computed query embedding from AgentState (populated by
+    earlier retrieval nodes) to avoid re-encoding the query.  On a cache hit
+    the pipeline short-circuits directly to finalize.
+    """
+    cache = get_default_semantic_cache()
+    embedding = state.get("query_embedding")
+    result = await cache.get(state["query"], embedding=embedding)
+
+    if result:
+        logger.info(
+            "semantic_cache_hit",
+            similarity=result.similarity,
+            query=state["query"][:80],
+        )
+        return {
+            "final_answer": result.answer,
+            "citations": result.citations,
+            "agent_trace": [
+                {
+                    "node": "semantic_cache_check",
+                    "hit": True,
+                    "similarity": result.similarity,
+                    "score": result.eval_score,
+                }
+            ],
+        }
+
+    logger.info("semantic_cache_miss", query=state["query"][:80])
+    return {"agent_trace": [{"node": "semantic_cache_check", "hit": False}]}
+
+
+def route_after_semantic_cache(
+    state: AgentState,
 ) -> Literal["finalize", "query_router"]:
-    """Route to finalize on cache hit, otherwise continue the normal pipeline."""
+    """Route to finalize on semantic cache hit, otherwise run full RAG."""
     return "finalize" if state.get("final_answer") else "query_router"
 
 
@@ -236,6 +282,7 @@ def build_simple_workflow() -> StateGraph:
     # Nodes
     workflow.add_node("sanitize_input", sanitize_input)
     workflow.add_node("memory_check", memory_check)
+    workflow.add_node("semantic_cache_check", semantic_cache_check)
     workflow.add_node("query_router", _query_router_node)
     workflow.add_node("query_analyzer", query_analyzer)
     workflow.add_node("retrieve", retrieve)
@@ -257,6 +304,11 @@ def build_simple_workflow() -> StateGraph:
     workflow.add_conditional_edges(
         "memory_check",
         route_after_memory_check,
+        {"finalize": "finalize", "semantic_cache_check": "semantic_cache_check"},
+    )
+    workflow.add_conditional_edges(
+        "semantic_cache_check",
+        route_after_semantic_cache,
         {"finalize": "finalize", "query_router": "query_router"},
     )
 
@@ -320,6 +372,7 @@ def get_initial_state(query: str, max_retries: int = 2) -> AgentState:
         max_retries=max_retries,
         should_rewrite_query=False,
         final_answer=None,
+        query_embedding=None,
         cost_so_far=0.0,
         agent_trace=[],
     )

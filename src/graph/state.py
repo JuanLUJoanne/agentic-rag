@@ -48,6 +48,9 @@ class AgentState(TypedDict):
     # ── Output ────────────────────────────────────────────────────────────────
     final_answer: str | None
 
+    # ── Semantic cache ────────────────────────────────────────────────────────
+    query_embedding: list[float] | None
+
     # ── Observability ─────────────────────────────────────────────────────────
     cost_so_far: float
     # operator.add reducer accumulates trace entries across all nodes instead of overwriting

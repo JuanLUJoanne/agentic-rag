@@ -39,10 +39,13 @@ accelerate = {version = ">=0.27.0", optional = true}
 presidio-analyzer = {version = ">=2.2.0", optional = true}
 presidio-anonymizer = {version = ">=2.2.0", optional = true}
 spacy = {version = ">=3.0.0", optional = true}
+# Optional ANN index — install with: pip install -e ".[semantic]"
+faiss-cpu = {version = ">=1.7.0", optional = true}
 
 [tool.poetry.extras]
 finetune = ["sentence-transformers", "peft", "trl", "bitsandbytes", "accelerate"]
 pii = ["presidio-analyzer", "presidio-anonymizer", "spacy"]
+semantic = ["faiss-cpu"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0"
