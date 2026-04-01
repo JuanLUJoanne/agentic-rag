@@ -1,0 +1,30 @@
+{
+  "benchmark": "retrieval_comparison",
+  "dataset": "eval_data/qa_100.jsonl",
+  "document_count": 191,
+  "query_count": 100,
+  "top_k": 5,
+  "results": {
+    "bm25_only": {
+      "avg_latency_ms": 0.99,
+      "keyword_overlap_at_5": 0.494,
+      "mrr": 0.663
+    },
+    "dense_only": {
+      "avg_latency_ms": 0.07,
+      "keyword_overlap_at_5": 0.173,
+      "mrr": 0.221,
+      "note": "mock retriever \u2014 fixed 5 docs regardless of query"
+    },
+    "rrf_merged": {
+      "avg_latency_ms": 1.94,
+      "keyword_overlap_at_5": 0.463,
+      "mrr": 0.659
+    }
+  },
+  "rrf_parameters": {
+    "k": 60,
+    "note": "k=60 is standard RRF constant; higher k = more rank equality"
+  },
+  "conclusion": "RRF achieves -0.6% MRR vs best single retriever at 2.0x BM25 latency overhead"
+}

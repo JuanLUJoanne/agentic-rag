@@ -1,0 +1,40 @@
+{
+  "benchmark": "supervisor_routing_quality",
+  "query_count": 50,
+  "llm": "DummyLLM (deterministic: research\u2192analysis\u2192quality\u2192done)",
+  "routing_accuracy": 0.7,
+  "by_difficulty": {
+    "simple": {
+      "accuracy": 0.0,
+      "avg_steps": 11.0,
+      "avg_latency_ms": 6.2
+    },
+    "comparison": {
+      "accuracy": 1.0,
+      "avg_steps": 11.0,
+      "avg_latency_ms": 6.3
+    },
+    "multi_hop": {
+      "accuracy": 1.0,
+      "avg_steps": 11.0,
+      "avg_latency_ms": 5.9
+    },
+    "ambiguous": {
+      "accuracy": 1.0,
+      "avg_steps": 11.0,
+      "avg_latency_ms": 5.7
+    }
+  },
+  "misroute_analysis": {
+    "misroute_rate": 0.3,
+    "avg_extra_steps_on_misroute": 2.0,
+    "recovery_rate": 1.0,
+    "note": "All misroutes are simple queries that received analysis+quality steps they didn't strictly need. Answer is still correct \u2014 extra steps are cost/latency overhead only, not correctness failures."
+  },
+  "overhead": {
+    "supervisor_decision_latency_ms": 0.04,
+    "simple_workflow_latency_ms": 5.3,
+    "delta_ms": 5.25,
+    "note": "DummyLLM decision cost is near-zero; real LLM adds ~500-1000ms per decision"
+  }
+}

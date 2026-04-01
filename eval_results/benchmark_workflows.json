@@ -1,0 +1,58 @@
+{
+  "benchmark": "workflow_comparison",
+  "dataset": "eval_data/qa_100.jsonl",
+  "query_count": 100,
+  "llm": "DummyLLM (offline)",
+  "results": {
+    "simple_corrective_rag": {
+      "completion_rate": 1.0,
+      "avg_steps": 11.0,
+      "avg_retries": 1.0,
+      "avg_cost": 0.0,
+      "avg_latency_ms": 22.589,
+      "avg_quality": 0.5242
+    },
+    "multi_agent_supervisor": {
+      "completion_rate": 1.0,
+      "avg_steps": 11.0,
+      "avg_retries": 3.0,
+      "avg_cost": 0.0,
+      "avg_latency_ms": 21.8996,
+      "avg_quality": 0.5242
+    }
+  },
+  "by_difficulty": {
+    "simple": {
+      "winner": "multi_agent",
+      "reason": "same quality, faster",
+      "simple_quality": 0.5336,
+      "multi_quality": 0.5336,
+      "simple_latency_ms": 36.9625,
+      "multi_latency_ms": 34.7307
+    },
+    "comparison": {
+      "winner": "simple_rag",
+      "reason": "same quality, lower latency",
+      "simple_quality": 0.5592,
+      "multi_quality": 0.5592,
+      "simple_latency_ms": 8.5372,
+      "multi_latency_ms": 9.3199
+    },
+    "multi_hop": {
+      "winner": "simple_rag",
+      "reason": "same quality, lower latency",
+      "simple_quality": 0.4921,
+      "multi_quality": 0.4921,
+      "simple_latency_ms": 8.2871,
+      "multi_latency_ms": 10.4101
+    },
+    "ambiguous": {
+      "winner": "multi_agent",
+      "reason": "same quality, faster",
+      "simple_quality": 0.4593,
+      "multi_quality": 0.4593,
+      "simple_latency_ms": 13.0893,
+      "multi_latency_ms": 11.0736
+    }
+  }
+}
