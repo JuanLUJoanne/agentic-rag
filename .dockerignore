@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.git/
+.gitignore
+
+# Local data files (mounted as volume in production)
+data/
+
+# Dev and docs
+docs/
+scripts/
+eval_data/
+eval_results/
+tests/
+*.md
+!README.md
+
+# Python packaging artifacts
+*.egg-info/
+dist/
+build/
