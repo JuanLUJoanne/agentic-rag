@@ -14,8 +14,55 @@ import structlog
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_random
 
 logger = structlog.get_logger()
+
+# Import OpenAI exception types; fall back to an empty tuple if openai is not installed.
+try:
+    from openai import APIConnectionError, APITimeoutError, RateLimitError
+
+    _RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
+        RateLimitError,
+        APIConnectionError,
+        APITimeoutError,
+    )
+except ImportError:  # pragma: no cover
+    RateLimitError = None  # type: ignore[assignment,misc]
+    APIConnectionError = None  # type: ignore[assignment,misc]
+    APITimeoutError = None  # type: ignore[assignment,misc]
+    _RETRYABLE_EXCEPTIONS = ()
+
+
+def _log_retry(retry_state: Any) -> None:
+    """Log each retry attempt with attempt number and upcoming wait duration."""
+    wait = retry_state.next_action.sleep if retry_state.next_action else 0
+    logger.warning(
+        "llm_retry",
+        attempt=retry_state.attempt_number,
+        wait=round(wait, 3),
+    )
+
+
+def _make_retry_decorator() -> Any:
+    """Build a tenacity retry decorator that only retries on retryable exceptions."""
+    if not _RETRYABLE_EXCEPTIONS:
+        # No openai installed — return a no-op decorator
+        def _noop(fn: Any) -> Any:
+            return fn
+
+        return _noop
+
+    return retry(
+        wait=wait_exponential(multiplier=1, min=1, max=60) + wait_random(0, 2),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
+        after=_log_retry,
+        reraise=True,
+    )
+
+
+_llm_retry = _make_retry_decorator()
 
 
 class DummyLLM(BaseChatModel):

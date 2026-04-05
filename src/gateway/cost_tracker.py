@@ -162,3 +162,128 @@ def get_default_tracker() -> CostTracker:
     if _default_tracker is None:
         _default_tracker = CostTracker()
     return _default_tracker
+
+
+# ── Tenant-aware cost tracker ───────────────────────────────────────────────
+
+
+class TenantBudgetExceededError(Exception):
+    """Raised when a tenant's cumulative cost meets or exceeds their budget."""
+
+    def __init__(self, tenant_id: str, cost: float, budget: float) -> None:
+        super().__init__(
+            f"Budget exceeded for tenant '{tenant_id}': ${cost:.6f} >= ${budget:.6f}"
+        )
+        self.tenant_id = tenant_id
+        self.cost = cost
+        self.budget = budget
+
+
+# Expose as BudgetExceededError for tenant context (per task spec)
+# We keep the original BudgetExceededError for backwards compat and add
+# TenantBudgetExceededError for tenant-specific raises.
+
+
+class TenantCostTracker:
+    """
+    Per-tenant cost tracker with individual budget enforcement.
+
+    Costs are accumulated per tenant using Decimal arithmetic.
+    ``TenantBudgetExceededError`` is raised after recording usage that
+    pushes a tenant over their budget.
+
+    Usage::
+
+        tracker = TenantCostTracker(global_budget=500.0)
+        tracker.set_budget("acme", 50.0)
+        tracker.record("acme", "gpt-4o-mini", input_tokens=100, output_tokens=50)
+    """
+
+    def __init__(self, global_budget: float = 100.0) -> None:
+        self._global_budget = Decimal(str(global_budget))
+        self._tenant_costs: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        self._tenant_budgets: dict[str, Decimal] = {}
+
+    def set_budget(self, tenant_id: str, budget: float) -> None:
+        """Set a spending budget for a tenant."""
+        self._tenant_budgets[tenant_id] = Decimal(str(budget))
+
+    def _compute_cost(self, model: str, input_tokens: int, output_tokens: int) -> Decimal:
+        pricing = _PRICING.get(model, _PRICING["default"])
+        return (
+            Decimal(str(input_tokens)) * pricing["input"] / _MILLION
+            + Decimal(str(output_tokens)) * pricing["output"] / _MILLION
+        )
+
+    def record(
+        self,
+        tenant_id: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """
+        Record token usage for a tenant.
+
+        Raises TenantBudgetExceededError if the tenant's cumulative cost
+        meets or exceeds their configured budget. Usage is recorded before
+        the raise.
+        """
+        cost = self._compute_cost(model, input_tokens, output_tokens)
+        self._tenant_costs[tenant_id] += cost
+
+        logger.info(
+            "tenant_usage_recorded",
+            tenant=tenant_id,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=float(cost),
+            total=float(self._tenant_costs[tenant_id]),
+        )
+
+        if tenant_id in self._tenant_budgets:
+            budget = self._tenant_budgets[tenant_id]
+            if self._tenant_costs[tenant_id] >= budget:
+                logger.error(
+                    "tenant_budget_exceeded",
+                    tenant=tenant_id,
+                    total=float(self._tenant_costs[tenant_id]),
+                    budget=float(budget),
+                )
+                raise TenantBudgetExceededError(
+                    tenant_id=tenant_id,
+                    cost=float(self._tenant_costs[tenant_id]),
+                    budget=float(budget),
+                )
+
+    def tenant_summary(self, tenant_id: str) -> dict:
+        """Return summary dict for a tenant."""
+        total = float(self._tenant_costs.get(tenant_id, Decimal("0")))
+        budget = float(self._tenant_budgets.get(tenant_id, self._global_budget))
+        remaining = max(0.0, budget - total)
+        return {
+            "tenant_id": tenant_id,
+            "total_cost": total,
+            "budget": budget,
+            "remaining": remaining,
+            "over_budget": total >= budget,
+        }
+
+    def all_tenants_summary(self) -> list[dict]:
+        """Return summary dicts for all known tenants."""
+        # Union of tenants that have costs or budgets
+        tenant_ids = set(self._tenant_costs.keys()) | set(self._tenant_budgets.keys())
+        return [self.tenant_summary(tid) for tid in sorted(tenant_ids)]
+
+
+# ── Tenant singleton ────────────────────────────────────────────────────────
+
+_tenant_tracker: TenantCostTracker | None = None
+
+
+def get_tenant_cost_tracker() -> TenantCostTracker:
+    global _tenant_tracker
+    if _tenant_tracker is None:
+        _tenant_tracker = TenantCostTracker()
+    return _tenant_tracker
