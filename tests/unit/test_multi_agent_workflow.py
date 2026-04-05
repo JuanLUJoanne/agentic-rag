@@ -151,7 +151,8 @@ async def test_api_simple_mode():
     from src.api.main import app
 
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
+        transport=ASGITransport(app=app), base_url="http://test",
+        headers={"X-API-Key": "dev-key"},
     ) as client:
         response = await client.post(
             "/query", json={"query": "What is RAG?", "mode": "simple"}
@@ -170,7 +171,8 @@ async def test_api_multi_agent_mode():
     from src.api.main import app
 
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
+        transport=ASGITransport(app=app), base_url="http://test",
+        headers={"X-API-Key": "dev-key"},
     ) as client:
         response = await client.post(
             "/query", json={"query": "What is LangGraph?", "mode": "multi_agent"}
@@ -190,7 +192,8 @@ async def test_api_default_mode_is_simple():
     from src.api.main import app
 
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
+        transport=ASGITransport(app=app), base_url="http://test",
+        headers={"X-API-Key": "dev-key"},
     ) as client:
         # No mode field — should default to simple
         response = await client.post("/query", json={"query": "What is RAG?"})
