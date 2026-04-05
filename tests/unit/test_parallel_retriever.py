@@ -11,6 +11,7 @@ from src.retrieval.circuit_breaker import CircuitOpenError
 from src.retrieval.models import SearchResult
 from src.retrieval.parallel_retriever import (
     ParallelRetriever,
+    _cross_encoder_rerank,
     _lost_in_middle_reorder,
     _rrf_merge,
     _SourceResult,
@@ -342,3 +343,113 @@ async def test_circuit_breaker_open_treated_as_source_failure(monkeypatch):
     # bm25 contributed nothing (circuit was open)
     bm25_ids = {r.doc_id for r in results if r.source == "bm25"}
     assert len(bm25_ids) == 0
+
+
+# ── Cross-Encoder reranking tests ─────────────────────────────────────────────
+
+
+def _docs(n: int) -> list[SearchResult]:
+    return [
+        SearchResult(doc_id=f"doc{i}", content=f"content {i}", score=1.0 / (i + 1), source="rrf_merged")
+        for i in range(n)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_disabled_by_default(monkeypatch):
+    """RERANKER_ENABLED defaults to false — cross-encoder model never loaded."""
+    monkeypatch.delenv("RERANKER_ENABLED", raising=False)
+    pr = ParallelRetriever()
+    with patch("src.retrieval.parallel_retriever._reranker_enabled", return_value=False):
+        results = await pr.retrieve("what is RAG?", top_k=3)
+    assert len(results) <= 3
+
+
+def _make_mock_cross_encoder(scores):
+    """Return a mock CrossEncoder instance that returns the given scores."""
+    import numpy as np
+    mock_model = MagicMock()
+    mock_model.predict.return_value = np.array(scores)
+    return mock_model
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_reranks_by_model_score():
+    """Cross-encoder reranks candidates by model score, not original RRF score."""
+    docs = _docs(4)
+    # Model says doc3 is best (score 0.99), doc0 is worst (score 0.01)
+    with patch("src.retrieval.parallel_retriever._load_cross_encoder",
+               return_value=_make_mock_cross_encoder([0.01, 0.30, 0.60, 0.99])):
+        result = await _cross_encoder_rerank("query", docs, top_k=4)
+
+    assert result[0].doc_id == "doc3"   # highest model score
+    assert result[-1].doc_id == "doc0"  # lowest model score
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_adds_reranker_score_to_metadata():
+    """Each result should have metadata['reranker_score'] set."""
+    docs = _docs(2)
+    with patch("src.retrieval.parallel_retriever._load_cross_encoder",
+               return_value=_make_mock_cross_encoder([0.8, 0.4])):
+        result = await _cross_encoder_rerank("query", docs, top_k=2)
+
+    assert "reranker_score" in result[0].metadata
+    assert result[0].metadata["reranker_score"] == pytest.approx(0.8, abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_respects_top_k():
+    """Only top_k results returned even if more candidates are passed."""
+    docs = _docs(6)
+    with patch("src.retrieval.parallel_retriever._load_cross_encoder",
+               return_value=_make_mock_cross_encoder([0.1, 0.5, 0.9, 0.3, 0.7, 0.2])):
+        result = await _cross_encoder_rerank("query", docs, top_k=3)
+
+    assert len(result) == 3
+    assert result[0].doc_id == "doc2"  # score 0.9 — highest
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_empty_input():
+    """Empty candidate list returns empty list without model call."""
+    result = await _cross_encoder_rerank("query", [], top_k=5)
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_fallback_on_import_error():
+    """If sentence_transformers is unavailable, fall back to top_k slice."""
+    docs = _docs(5)
+    with patch("src.retrieval.parallel_retriever._load_cross_encoder",
+               side_effect=ImportError("no module")):
+        result = await _cross_encoder_rerank("query", docs, top_k=3)
+
+    assert len(result) == 3
+
+
+@pytest.mark.asyncio
+async def test_cross_encoder_enabled_via_env(monkeypatch):
+    """RERANKER_ENABLED=true wires cross-encoder into the retrieve() pipeline."""
+    monkeypatch.setenv("RERANKER_ENABLED", "true")
+    monkeypatch.delenv("MMR_ENABLED", raising=False)
+
+    pr = ParallelRetriever()
+
+    async def mock_bm25(q, top_k=10):
+        return [SearchResult(doc_id=f"d{i}", content=f"doc {i}", score=0.9 - i * 0.1, source="bm25")
+                for i in range(4)]
+
+    async def mock_dense(q, top_k=10):
+        return []
+
+    pr.bm25.search = mock_bm25
+    pr.dense.search = mock_dense
+
+    # d1 gets highest cross-encoder score
+    with patch("src.retrieval.parallel_retriever._load_cross_encoder",
+               return_value=_make_mock_cross_encoder([0.1, 0.9, 0.3, 0.5, 0.2, 0.4, 0.15, 0.35])):
+        results = await pr.retrieve("neural retrieval", top_k=2)
+
+    assert len(results) <= 2
+    assert results[0].doc_id == "d1"

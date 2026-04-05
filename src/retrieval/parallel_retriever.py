@@ -23,6 +23,12 @@ Design choices:
     failures and probes for recovery, preventing cascade failures.
   - Contextual compression (opt-in via COMPRESSION_ENABLED=true): uses an
     LLM to extract only query-relevant sentences from each document.
+  - Cross-Encoder reranking (opt-in via RERANKER_ENABLED=true): reranks the
+    RRF candidates using a cross-encoder model (default:
+    cross-encoder/ms-marco-MiniLM-L-6-v2) that jointly encodes the query and
+    each document for higher-precision scoring than bi-encoder cosine similarity.
+    Runs as a blocking CPU call in a thread executor to avoid stalling the event
+    loop. Set RERANKER_MODEL to override the model name.
 """
 from __future__ import annotations
 
@@ -202,6 +208,79 @@ def _compression_enabled() -> bool:
     return os.getenv("COMPRESSION_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
+def _reranker_enabled() -> bool:
+    return os.getenv("RERANKER_ENABLED", "false").lower() in ("1", "true", "yes")
+
+
+def _reranker_model() -> str:
+    return os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+
+def _load_cross_encoder(model_name: str):
+    """
+    Load and return a CrossEncoder instance.
+
+    Extracted as a module-level function so tests can patch it without
+    needing sentence_transformers installed in the test environment.
+    """
+    from sentence_transformers import CrossEncoder  # lazy import
+    return CrossEncoder(model_name)
+
+
+async def _cross_encoder_rerank(
+    query: str,
+    candidates: list[SearchResult],
+    top_k: int,
+) -> list[SearchResult]:
+    """
+    Rerank candidates using a cross-encoder model.
+
+    Unlike bi-encoder retrieval (query and doc encoded separately), a
+    cross-encoder jointly encodes the (query, doc) pair with full attention
+    between them — producing more accurate relevance scores at the cost of
+    O(n) model forward passes (one per candidate).
+
+    This is why cross-encoders are only used for reranking a small candidate
+    set (top-50 from RRF) rather than for the initial retrieval over the full
+    corpus: they cannot pre-compute document representations.
+
+    Runs the synchronous CrossEncoder.predict() call in a thread executor
+    to avoid blocking the asyncio event loop.
+    """
+    if not candidates:
+        return candidates
+
+    model_name = _reranker_model()
+
+    def _predict() -> list[float]:
+        model = _load_cross_encoder(model_name)
+        pairs = [(query, doc.content) for doc in candidates]
+        return model.predict(pairs).tolist()
+
+    try:
+        scores = await asyncio.get_event_loop().run_in_executor(None, _predict)
+    except Exception as exc:
+        logger.warning("cross_encoder_error", error=str(exc), model=model_name)
+        return candidates[:top_k]
+
+    reranked = sorted(
+        zip(scores, candidates),
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    return [
+        SearchResult(
+            doc_id=doc.doc_id,
+            content=doc.content,
+            score=round(float(score), 6),
+            source=doc.source,
+            metadata={**doc.metadata, "reranker_score": round(float(score), 6)},
+        )
+        for score, doc in reranked[:top_k]
+    ]
+
+
 class ParallelRetriever:
     """
     Concurrent hybrid retriever with RRF fusion and per-source timeout.
@@ -284,7 +363,15 @@ class ParallelRetriever:
 
         candidates = _rrf_merge(source_results)
 
-        # Apply MMR if enabled
+        # Stage 1 — Cross-Encoder reranking (precision over recall)
+        # Reranks the full RRF candidate set before MMR so that MMR sees
+        # accurate cross-encoder scores rather than approximate RRF scores.
+        reranker_on = _reranker_enabled()
+        if reranker_on:
+            # Fetch more candidates for the reranker to work with, then trim
+            candidates = await _cross_encoder_rerank(query, candidates, top_k=top_k * 2)
+
+        # Stage 2 — MMR diversity (operates on cross-encoder scores when available)
         if _mmr_enabled():
             lambda_ = _mmr_lambda()
             merged = _mmr(candidates, top_k=top_k, lambda_=lambda_)
@@ -294,12 +381,12 @@ class ParallelRetriever:
             mmr_on = False
             lambda_ = None
 
-        # Apply Lost-in-the-Middle reordering if enabled
+        # Stage 3 — Lost-in-the-Middle reordering
         litm_on = _litm_enabled()
         if litm_on:
             merged = _lost_in_middle_reorder(merged)
 
-        # Apply contextual compression if enabled
+        # Stage 4 — Contextual compression
         if _compression_enabled():
             from src.retrieval.compressor import get_compressor
             merged = await get_compressor().compress_batch(query, merged)
@@ -309,6 +396,7 @@ class ParallelRetriever:
             per_source_counts={sr.name: len(sr.results) for sr in source_results},
             per_source_latency={sr.name: round(sr.latency, 3) for sr in source_results},
             failures=failures,
+            reranker_enabled=reranker_on,
             mmr_enabled=mmr_on,
             litm_enabled=litm_on,
         )
