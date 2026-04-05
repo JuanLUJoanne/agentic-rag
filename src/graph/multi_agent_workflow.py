@@ -10,6 +10,9 @@ Batch 4 adds production hardening:
   - Per-query cost tracking via get_default_tracker().
   - audit_log (new terminal node): appends a JSONL record after finalize.
 
+Batch 5 adds observability:
+  - supervisor_node instrumented with an OTel child span.
+
 Graph topology:
   sanitize_input ──► memory_check ──► supervisor ──► research_agent ──┐
        │ injection         │ hit             ▲        analysis_agent ──┤
@@ -41,6 +44,7 @@ from src.graph.simple_workflow import (
     sanitize_input,
 )
 from src.graph.state import AgentState
+from src.observability.tracing import get_tracer
 
 logger = structlog.get_logger()
 
@@ -77,12 +81,16 @@ _supervisor = Supervisor(registry=_registry, max_iterations=5, budget=0.05)
 
 
 async def supervisor_node(state: SupervisorState) -> dict:
-    """LangGraph node: ask the supervisor which agent to dispatch next."""
-    decision = await _supervisor.decide(state)
-    return {
-        "supervisor_decision": decision,
-        "agent_trace": [{"node": "supervisor", "decision": decision}],
-    }
+    """LangGraph node: ask the supervisor which agent to dispatch next.
+
+    Instrumented with an OTel child span named 'supervisor_node'.
+    """
+    with get_tracer().start_as_current_span("supervisor_node"):
+        decision = await _supervisor.decide(state)
+        return {
+            "supervisor_decision": decision,
+            "agent_trace": [{"node": "supervisor", "decision": decision}],
+        }
 
 
 async def research_agent_node(state: SupervisorState) -> dict:
@@ -283,7 +291,6 @@ def build_multi_agent_workflow() -> StateGraph:
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
-
 _checkpointer = MemorySaver()
 graph = build_multi_agent_workflow().compile(checkpointer=_checkpointer)
 

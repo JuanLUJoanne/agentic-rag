@@ -4,6 +4,7 @@ FastAPI application — public HTTP interface for both RAG workflows.
 POST /query          run simple or multi-agent workflow, return grounded answer
 POST /query/stream   SSE stream of workflow events
 GET  /health         liveness probe
+GET  /metrics        Prometheus metrics
 GET  /costs          cost summary by model
 GET  /eval/drift     latest drift report (auto-saved baseline on first call)
 GET  /compliance/pii-report   PII detection statistics from the audit log
@@ -11,6 +12,8 @@ GET  /compliance/pii-report   PII detection statistics from the audit log
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -20,18 +23,26 @@ from typing import Any, Literal
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, field_validator
 
+from src.api.dedup import get_deduplicator
 from src.api.human_review import router as review_router
+from src.api.middleware import APIKeyMiddleware, load_api_keys
 from src.api.streaming import stream_query
 from src.gateway.cost_tracker import get_default_tracker
 from src.graph.multi_agent_workflow import get_initial_supervisor_state
 from src.graph.multi_agent_workflow import graph as multi_agent_graph
 from src.graph.simple_workflow import get_initial_state
 from src.graph.simple_workflow import graph as simple_graph
+from src.observability.metrics import get_metrics
+from src.observability.tracing import get_tracer, setup_tracing
 
 logger = structlog.get_logger()
+
+# ── Concurrency cap — limits in-flight requests so shutdown drains cleanly ──────
+_ACTIVE_SEM = asyncio.Semaphore(500)
 
 app = FastAPI(
     title="Agentic RAG",
@@ -42,8 +53,28 @@ app = FastAPI(
     ),
 )
 
+# Authentication middleware
+app.add_middleware(APIKeyMiddleware, keys=load_api_keys())
+
 # Mount the review router
 app.include_router(review_router)
+
+
+# ── Lifecycle events ────────────────────────────────────────────────────────────
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    setup_tracing("agentic-rag")
+    logger.info("startup_complete")
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    logger.info("shutdown_initiated")
+
+
+# ── Request / response models ───────────────────────────────────────────────────
 
 
 class QueryRequest(BaseModel):
@@ -69,9 +100,19 @@ class QueryResponse(BaseModel):
     iteration_count: int
 
 
+# ── Endpoints ───────────────────────────────────────────────────────────────────
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Expose Prometheus metrics in text/plain format."""
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -79,48 +120,90 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     """
     Run the requested workflow and return a grounded answer.
 
-    mode=simple   → single-graph Corrective RAG (fast, lower cost)
+    mode=simple      → single-graph Corrective RAG (fast, lower cost)
     mode=multi_agent → skills-based supervisor with specialist agents
     """
-    thread_id = str(uuid.uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
+    metrics = get_metrics()
+    tracer = get_tracer()
+    dedup = get_deduplicator()
 
-    logger.info(
-        "api_query_start",
-        query=request.query[:80],
-        mode=request.mode,
-        thread_id=thread_id,
-    )
+    # Deduplication key: sha256(query + mode)
+    dedup_key = hashlib.sha256(f"{request.query}:{request.mode}".encode()).hexdigest()
 
-    try:
-        if request.mode == "multi_agent":
-            initial_state = get_initial_supervisor_state(
-                request.query, mode="multi_agent", max_retries=request.max_retries
+    async with _ACTIVE_SEM:
+        metrics.active_requests.inc()
+        import time
+
+        start = time.perf_counter()
+        status = "success"
+        try:
+            with tracer.start_as_current_span("rag.workflow") as span:
+                thread_id = str(uuid.uuid4())
+                span.set_attribute("workflow.mode", request.mode)
+                span.set_attribute("workflow.thread_id", thread_id)
+
+                config = {"configurable": {"thread_id": thread_id}}
+
+                logger.info(
+                    "api_query_start",
+                    query=request.query[:80],
+                    mode=request.mode,
+                    thread_id=thread_id,
+                )
+
+                try:
+                    if request.mode == "multi_agent":
+
+                        async def _run_multi():
+                            initial_state = get_initial_supervisor_state(
+                                request.query,
+                                mode="multi_agent",
+                                max_retries=request.max_retries,
+                            )
+                            return await multi_agent_graph.ainvoke(
+                                initial_state, config=config
+                            )
+
+                        final_state = await dedup.get_or_run(dedup_key, _run_multi)
+                    else:
+
+                        async def _run_simple():
+                            initial_state = get_initial_state(
+                                request.query, max_retries=request.max_retries
+                            )
+                            return await simple_graph.ainvoke(initial_state, config=config)
+
+                        final_state = await dedup.get_or_run(dedup_key, _run_simple)
+
+                except Exception as exc:
+                    status = "error"
+                    logger.error("workflow_error", error=str(exc), query=request.query[:80])
+                    raise HTTPException(
+                        status_code=500, detail=f"Workflow error: {exc}"
+                    ) from exc
+
+            logger.info(
+                "api_query_complete",
+                thread_id=thread_id,
+                mode=request.mode,
+                has_answer=bool(final_state.get("final_answer")),
             )
-            final_state = await multi_agent_graph.ainvoke(initial_state, config=config)
-        else:
-            initial_state = get_initial_state(request.query, max_retries=request.max_retries)
-            final_state = await simple_graph.ainvoke(initial_state, config=config)
-    except Exception as exc:
-        logger.error("workflow_error", error=str(exc), query=request.query[:80])
-        raise HTTPException(status_code=500, detail=f"Workflow error: {exc}") from exc
 
-    logger.info(
-        "api_query_complete",
-        thread_id=thread_id,
-        mode=request.mode,
-        has_answer=bool(final_state.get("final_answer")),
-    )
-
-    return QueryResponse(
-        answer=final_state.get("final_answer") or "",
-        citations=final_state.get("citations") or [],
-        agent_trace=final_state.get("agent_trace") or [],
-        cost_so_far=final_state.get("cost_so_far") or 0.0,
-        mode=request.mode,
-        agents_used=final_state.get("agents_called") or [],
-        iteration_count=final_state.get("iteration_count") or 0,
-    )
+            return QueryResponse(
+                answer=final_state.get("final_answer") or "",
+                citations=final_state.get("citations") or [],
+                agent_trace=final_state.get("agent_trace") or [],
+                cost_so_far=final_state.get("cost_so_far") or 0.0,
+                mode=request.mode,
+                agents_used=final_state.get("agents_called") or [],
+                iteration_count=final_state.get("iteration_count") or 0,
+            )
+        finally:
+            elapsed = time.perf_counter() - start
+            metrics.request_duration_seconds.labels(
+                mode=request.mode, status=status
+            ).observe(elapsed)
+            metrics.active_requests.dec()
 
 
 @app.post("/query/stream")
@@ -131,19 +214,20 @@ async def query_stream_endpoint(request: QueryRequest) -> StreamingResponse:
     Each event is a JSON line prefixed with ``data: ``.  The stream ends
     with an event of type ``done`` carrying the full answer summary.
     """
-    logger.info(
-        "api_stream_start",
-        query=request.query[:80],
-        mode=request.mode,
-    )
-    return StreamingResponse(
-        stream_query(request.query, mode=request.mode),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    async with _ACTIVE_SEM:
+        logger.info(
+            "api_stream_start",
+            query=request.query[:80],
+            mode=request.mode,
+        )
+        return StreamingResponse(
+            stream_query(request.query, mode=request.mode),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
 
 @app.get("/costs")

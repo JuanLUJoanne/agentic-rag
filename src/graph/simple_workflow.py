@@ -9,6 +9,10 @@ Batch 4 adds production hardening:
   - gate_generate: awaits rate-limiter capacity before calling the LLM.
   - audit_log (new terminal node): appends a JSONL audit record after finalize.
 
+Batch 5 adds observability:
+  - memory_check, retrieve (gate_generate), generate_node instrumented with
+    child OTel spans via get_tracer().start_as_current_span().
+
 Graph topology:
   sanitize_input ──► memory_check ──► semantic_cache_check ──► query_router → query_analyzer → retrieve → grade_documents
        │ injection          │ hit             │ hit                    ↓ all_relevant              ↑ rewrite loops back
@@ -43,6 +47,7 @@ from src.agents.web_search import web_search
 from src.gateway.rate_limiter import get_default_rate_limiter
 from src.gateway.security import AuditLogger, InputSanitizer, PromptInjectionDetected
 from src.graph.state import AgentState
+from src.observability.tracing import get_tracer
 from src.retrieval.memory import get_default_memory
 from src.retrieval.semantic_cache import get_default_semantic_cache
 from src.utils.llm import DummyLLM, get_llm
@@ -92,10 +97,11 @@ async def gate_generate(state: AgentState) -> dict:
     LangGraph node: acquire rate-limiter capacity, then generate.
 
     Wraps the agent ``generate`` function so we can enforce per-model RPM/TPM
-    limits without modifying the agent itself.
+    limits without modifying the agent itself.  Instrumented with an OTel span.
     """
-    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
-    return await _generate(state)
+    with get_tracer().start_as_current_span("generate_node"):
+        await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
+        return await _generate(state)
 
 
 # ── Audit log node ─────────────────────────────────────────────────────────────
@@ -125,23 +131,28 @@ async def memory_check(state: AgentState) -> dict:
 
     Memory pattern: answering from memory costs zero LLM calls and zero
     retrieval latency. The quality bar (min_faithfulness=0.85) ensures
-    we only serve answers we're confident in.
+    we only serve answers we're confident in.  Instrumented with an OTel span.
     """
-    memory = get_default_memory()
-    result = await memory.recall(state["query"])
+    with get_tracer().start_as_current_span("memory_check_node"):
+        memory = get_default_memory()
+        result = await memory.recall(state["query"])
 
-    if result:
-        logger.info("memory_check_hit", query=state["query"][:80], score=result.eval_score)
+        if result:
+            logger.info(
+                "memory_check_hit", query=state["query"][:80], score=result.eval_score
+            )
+            return {
+                "final_answer": result.answer,
+                "citations": result.citations,
+                "agent_trace": [
+                    {"node": "memory_check", "hit": True, "score": result.eval_score}
+                ],
+            }
+
+        logger.info("memory_check_miss", query=state["query"][:80])
         return {
-            "final_answer": result.answer,
-            "citations": result.citations,
-            "agent_trace": [{"node": "memory_check", "hit": True, "score": result.eval_score}],
+            "agent_trace": [{"node": "memory_check", "hit": False}],
         }
-
-    logger.info("memory_check_miss", query=state["query"][:80])
-    return {
-        "agent_trace": [{"node": "memory_check", "hit": False}],
-    }
 
 
 def route_after_memory_check(
@@ -194,6 +205,15 @@ def route_after_semantic_cache(
 ) -> Literal["finalize", "query_router"]:
     """Route to finalize on semantic cache hit, otherwise run full RAG."""
     return "finalize" if state.get("final_answer") else "query_router"
+
+
+# ── Retrieve node (instrumented) ───────────────────────────────────────────────
+
+
+async def retrieve_node(state: AgentState) -> dict:
+    """LangGraph node: run retrieval with an OTel child span."""
+    with get_tracer().start_as_current_span("retrieve_node"):
+        return await retrieve(state)
 
 
 # ── Terminal node ──────────────────────────────────────────────────────────────
@@ -285,7 +305,7 @@ def build_simple_workflow() -> StateGraph:
     workflow.add_node("semantic_cache_check", semantic_cache_check)
     workflow.add_node("query_router", _query_router_node)
     workflow.add_node("query_analyzer", query_analyzer)
-    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("grade_documents", grade_documents)
     workflow.add_node("generate", gate_generate)
     workflow.add_node("rewrite_query", rewrite_query)
@@ -347,7 +367,6 @@ def build_simple_workflow() -> StateGraph:
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
-
 _checkpointer = MemorySaver()
 graph = build_simple_workflow().compile(checkpointer=_checkpointer)
 
