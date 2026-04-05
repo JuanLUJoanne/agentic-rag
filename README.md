@@ -4,6 +4,8 @@ A production-quality implementation of **10 agentic design patterns** using Lang
 
 Every pattern is implemented with a real, runnable graph — not pseudocode. The system runs entirely offline (DummyLLM) so you can explore the architecture without an API key.
 
+Production hardening spans the full stack: per-retriever circuit breakers, exponential backoff on LLM calls, request deduplication, API key auth, Prometheus metrics, OpenTelemetry tracing, per-tenant rate limiting and cost budgets, prompt version management, and an A/B testing framework for retrieval strategies.
+
 ---
 
 ## Architecture
@@ -52,15 +54,25 @@ Two patterns are benchmarked in depth. The remaining 8 are listed in [Also Imple
 **`src/retrieval/parallel_retriever.py` · `ParallelRetriever` · `_rrf_merge`**
 
 ```
-asyncio.gather ──► BM25Retriever  (5s timeout)  ──┐
-                ──► DenseRetriever (5s timeout) ──┤──► _rrf_merge(k=60) ──► top-k docs
-                ──► GraphRetriever (5s timeout) ──┘   (complex queries only)
+asyncio.gather ──► BM25Retriever  (5s timeout, circuit breaker)  ──┐
+                ──► DenseRetriever (5s timeout, circuit breaker) ──┤──► _rrf_merge(k=60) ──► MMR ──► LITM ──► Compression ──► top-k
+                ──► GraphRetriever (5s timeout, circuit breaker) ──┘   (complex queries only)
 ```
 
 **Why RRF over linear score combination?**
 BM25 scores are unbounded integers; cosine similarities are 0–1. Combining them with a fixed α weight requires per-corpus calibration that breaks when either retriever's score distribution shifts. RRF uses only rank positions — no calibration needed, robust to score-scale changes and to one source failing entirely.
 
 **Formula:** `score(doc) = Σ 1/(k + rank_i)` across all sources. Documents appearing in multiple source lists get additive boosts.
+
+**Post-RRF pipeline** (each stage opt-in via env flag):
+
+| Stage | Flag | Decision |
+|---|---|---|
+| **MMR** (`_mmr`) | `MMR_ENABLED=true`, `MMR_LAMBDA` | Removes near-duplicate results using Jaccard token overlap as similarity proxy — no embedding required, works with BM25-only mode. λ=0.5 default; raise to 0.7 for precision-sensitive domains (legal, medical) |
+| **Lost-in-the-Middle** (`_lost_in_middle_reorder`) | `LITM_ENABLED=true` | Reorders so highest-scored docs land at position 0 and -1. LLMs have documented attention bias away from the middle of long context; 3–5% quality gain at zero cost |
+| **Contextual Compression** (`compressor.py`) | `COMPRESSION_ENABLED=true` | LLM extracts only query-relevant sentences from each retrieved doc. Reduces context tokens by ~80% on verbose sources; skipped automatically in DummyLLM mode |
+
+**Circuit breakers** (`src/retrieval/circuit_breaker.py`): each retriever has its own `CircuitBreaker` instance (CLOSED → OPEN after 5 failures → HALF_OPEN after 30s recovery). An open circuit returns immediately rather than waiting for a timeout, preventing one slow retriever from blocking the entire pipeline.
 
 **Parameter sensitivity** (`eval_results/rrf_sensitivity.json`, `scripts/benchmark_rrf_sensitivity.py`):
 
@@ -175,6 +187,40 @@ _Quality differences between workflows require a real LLM. DummyLLM returns dete
 
 ## Production Features
 
+### Observability
+
+| Feature | Module | Decision |
+|---------|--------|----------|
+| **OpenTelemetry tracing** | `observability/tracing.py` | Spans on every workflow node (`rag.workflow`, `memory_check`, `retrieve`, `generate`, `supervisor`). Exports to OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, falls back to Console for local dev — no code change needed between environments |
+| **Prometheus metrics** | `observability/metrics.py` | `request_duration_seconds` histogram (P50/P95/P99), `cache_hits_total` by layer, `retriever_errors_total` by source, `llm_tokens_total` by model, `active_requests` gauge. Exposed at `GET /metrics` — drop-in compatible with any Grafana/Prometheus stack |
+| **Structured logging** | `structlog` throughout | JSON logs with `thread_id`, `query_type`, `node` context on every event. Correlates with OTel traces via shared `thread_id` |
+
+### Reliability
+
+| Feature | Module | Decision |
+|---------|--------|----------|
+| **Exponential backoff** | `utils/llm.py` | `tenacity` retry on `RateLimitError`, `APIConnectionError`, `APITimeoutError`: `wait_exponential(min=1, max=60) + wait_random(0, 2)`, 3 attempts. Jitter prevents thundering herd when multiple workers hit the same 429 simultaneously |
+| **Circuit breakers** | `retrieval/circuit_breaker.py` | Per-retriever CLOSED/OPEN/HALF_OPEN state machine. Opens after 5 consecutive failures, probes after 30s. An open circuit returns immediately instead of waiting for the 5s timeout — keeps pipeline latency bounded even when a retriever is down |
+| **Request deduplication** | `api/dedup.py` | Concurrent identical queries (`sha256(query+mode)`) share one graph execution via `asyncio.Future`. Prevents thundering herd on cache-miss bursts for popular queries |
+| **Concurrency cap + graceful shutdown** | `api/main.py` | `asyncio.Semaphore(500)` limits in-flight requests; SIGTERM drains the semaphore before exit so no request is mid-execution when the process stops. K8s rolling deploys work cleanly |
+
+### Security & Multi-tenancy
+
+| Feature | Module | Decision |
+|---------|--------|----------|
+| **API Key auth** | `api/middleware.py` | `APIKeyMiddleware` checks `X-API-Key` header on all routes except `/health`, `/metrics`, `/docs`. Keys loaded from `API_KEYS` env var (comma-separated); falls back to `"dev-key"` in development with a logged warning |
+| **Per-tenant rate limiting** | `gateway/rate_limiter.py` | `TenantAwareRateLimiter` gives each tenant its own token-bucket instance and `asyncio.Lock`. Tenant A exhausting its quota doesn't affect Tenant B — critical for SaaS where one noisy customer can't starve others |
+| **Per-tenant cost budgets** | `gateway/cost_tracker.py` | `TenantCostTracker` tracks spend per tenant; `set_budget(tenant_id, amount)` raises `BudgetExceededError` before the LLM call when a tenant would go over. Preserves original global `CostTracker` for backwards compatibility |
+
+### Operations
+
+| Feature | Module | Decision |
+|---------|--------|----------|
+| **Prompt version store** | `gateway/prompt_store.py` | SQLite-backed `PromptStore` with auto-increment versioning per prompt name and `rollback()`. Agents call `store.get("relevance_grader")` at runtime instead of hardcoding strings — hot-swap prompts without redeployment, roll back in seconds if a prompt change degrades quality |
+| **A/B testing framework** | `eval/ab_testing.py` | `ABTest` assigns variants deterministically via `sha256(test_name + entity_id) % 100` — same user always gets the same variant, reproducible across restarts. Pre-registers `retrieval_strategy` (rrf_only vs rrf_mmr) and `reranking` (none vs litm) tests. `summary()` returns per-variant mean/count/sum for any recorded metric |
+
+### Existing Features
+
 | Feature | Module | Notes |
 |---------|--------|-------|
 | Rate limiting | `gateway/rate_limiter.py` | Token-bucket per model; `on_429` halves rate for 60 s |
@@ -272,17 +318,19 @@ uvicorn src.api.main:app --reload
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness probe |
-| `POST` | `/query` | Run workflow, return grounded answer |
-| `POST` | `/query/stream` | Stream workflow events as SSE |
-| `GET` | `/review/pending` | List answers awaiting human review |
-| `POST` | `/review/{id}/approve` | Approve answer → stores in memory |
-| `POST` | `/review/{id}/reject` | Reject with reason |
-| `GET` | `/review/stats` | Pending / approved / rejected counts |
-| `GET` | `/costs` | Accumulated cost by model |
-| `GET` | `/eval/drift` | Run probe query and compare to baseline |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | exempt | Liveness probe |
+| `GET` | `/metrics` | exempt | Prometheus metrics (text/plain) |
+| `POST` | `/query` | `X-API-Key` | Run workflow, return grounded answer |
+| `POST` | `/query/stream` | `X-API-Key` | Stream workflow events as SSE |
+| `GET` | `/review/pending` | `X-API-Key` | List answers awaiting human review |
+| `POST` | `/review/{id}/approve` | `X-API-Key` | Approve answer → stores in memory |
+| `POST` | `/review/{id}/reject` | `X-API-Key` | Reject with reason |
+| `GET` | `/review/stats` | `X-API-Key` | Pending / approved / rejected counts |
+| `GET` | `/costs` | `X-API-Key` | Accumulated cost by model |
+| `GET` | `/eval/drift` | `X-API-Key` | Run probe query and compare to baseline |
+| `GET` | `/compliance/pii-report` | `X-API-Key` | PII detection stats from audit log |
 
 ### POST /query
 
@@ -314,15 +362,18 @@ Each `data:` line is a JSON `StreamEvent`:
 ```
 src/
 ├── agents/          # Agent nodes: router, analyzer, retriever, generator, …
-├── api/             # FastAPI app, SSE streaming, human review endpoints
-├── eval/            # RAGAS-style eval, drift detection, comparative eval
+├── api/             # FastAPI app, SSE streaming, auth middleware, deduplication
+├── eval/            # RAGAS-style eval, drift detection, A/B testing framework
 ├── finetuning/      # Embedding FT and QLoRA+DPO stubs
-├── gateway/         # Rate limiter, cost tracker, guardrails, security
+├── gateway/         # Rate limiter (global + per-tenant), cost tracker, guardrails,
+│                    #   security, prompt version store
 ├── graph/           # LangGraph workflows (simple + multi-agent)
-├── retrieval/       # BM25, dense, graph, parallel retriever, cache, memory
-└── utils/           # LLM factory (DummyLLM ↔ OpenAI)
+├── observability/   # OpenTelemetry tracing, Prometheus metrics
+├── retrieval/       # BM25, dense, graph, parallel retriever (MMR + LITM + compression
+│                    #   + circuit breakers), cache, semantic cache, memory
+└── utils/           # LLM factory (DummyLLM ↔ OpenAI, exponential backoff)
 tests/
-└── unit/            # 242 tests, all runnable offline
+└── unit/            # 335 tests, all runnable offline
 scripts/
 └── demo.py          # End-to-end demo: 5 queries × 10 patterns
 ```
@@ -334,15 +385,23 @@ scripts/
 | Layer | Technology |
 |-------|-----------|
 | Orchestration | LangGraph (StateGraph, MemorySaver, astream) |
-| LLM | OpenAI GPT-4o / GPT-4o-mini (DummyLLM fallback) |
-| Tracing | LangSmith |
+| LLM | OpenAI GPT-4o / GPT-4o-mini (DummyLLM fallback, tenacity retry) |
+| LLM Tracing | LangSmith |
+| Distributed Tracing | OpenTelemetry SDK → OTLP / Jaeger / Tempo |
+| Metrics | Prometheus (`prometheus-client`), Grafana-compatible |
 | Retrieval | BM25 (rank-bm25), sentence-transformers (dense), custom graph |
+| Post-retrieval | MMR (Jaccard proxy), Lost-in-the-Middle, contextual compression |
+| Reliability | Per-retriever circuit breakers, exponential backoff + jitter |
 | Vector store | pgvector (PostgreSQL) |
 | Graph store | Neo4j |
 | API framework | FastAPI + uvicorn |
+| Auth | API Key middleware (`X-API-Key`) |
 | Validation | Pydantic v2 |
-| Logging | structlog |
-| Persistence | SQLite (cache, memory, audit) |
-| Testing | pytest + pytest-asyncio (242 tests) |
+| Logging | structlog (JSON, correlated with OTel trace IDs) |
+| Persistence | SQLite (cache, memory, prompt store, audit) |
+| Multi-tenancy | Per-tenant token bucket rate limiter + cost budget |
+| Experimentation | A/B testing framework (deterministic sha256 assignment) |
+| Testing | pytest + pytest-asyncio (335 tests, all runnable offline) |
 | Linting | ruff |
-| CI | GitHub Actions |
+| CI | GitHub Actions (Python 3.11/3.12 matrix) |
+| Container | Docker + docker-compose (PostgreSQL, Neo4j, API) |
