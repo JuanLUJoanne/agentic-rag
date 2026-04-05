@@ -11,16 +11,31 @@ Design choices:
     BM25 scores (unbounded) against cosine similarities (0–1).
   - query_type gating: graph retrieval adds latency and is only useful
     for multi-hop queries, so simple lookups skip it.
+  - MMR post-processing (opt-in via MMR_ENABLED=true): applies Maximal
+    Marginal Relevance after RRF to reduce redundant results. Uses token
+    Jaccard similarity as a document-similarity proxy so it works without
+    a live vector store. Enable with MMR_LAMBDA to tune relevance/diversity
+    trade-off (default 0.5; higher = more relevance, lower = more diversity).
+  - Lost-in-the-Middle reordering (opt-in via LITM_ENABLED=true): reorders
+    results so highest-scored docs are at positions 0 and -1 to combat
+    LLM attention bias toward the middle of long context.
+  - Circuit breakers (per-retriever): automatically opens after repeated
+    failures and probes for recovery, preventing cascade failures.
+  - Contextual compression (opt-in via COMPRESSION_ENABLED=true): uses an
+    LLM to extract only query-relevant sentences from each document.
 """
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import time
 from typing import NamedTuple
 
 import structlog
 
 from src.retrieval.bm25_retriever import SAMPLE_DOCS, BM25Retriever
+from src.retrieval.circuit_breaker import CircuitBreaker, CircuitOpenError, get_circuit_breaker
 from src.retrieval.dense_retriever import DenseRetriever
 from src.retrieval.graph_retriever import GraphRetriever
 from src.retrieval.models import SearchResult
@@ -74,6 +89,119 @@ def _rrf_merge(
     return merged
 
 
+def _tokenize(text: str) -> frozenset[str]:
+    """Lowercase word tokens — used for Jaccard similarity."""
+    return frozenset(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _mmr(
+    candidates: list[SearchResult],
+    top_k: int,
+    lambda_: float = 0.5,
+) -> list[SearchResult]:
+    """
+    Maximal Marginal Relevance reranking.
+
+    Iteratively selects the candidate that best balances:
+      score = λ · relevance(doc) − (1−λ) · max_similarity(doc, selected)
+
+    relevance  — normalised RRF score from the candidate list
+    similarity — Jaccard overlap of lowercased word tokens
+
+    Works without embeddings; effective for deduplicating BM25/RRF output
+    where near-duplicate passages share high token overlap.
+
+    lambda_=1.0 → pure relevance order (identical to no MMR)
+    lambda_=0.0 → pure diversity (greedy maximum coverage)
+    """
+    if not candidates:
+        return []
+
+    max_score = max(r.score for r in candidates) or 1.0
+    tokens = [_tokenize(r.content) for r in candidates]
+
+    selected_indices: list[int] = []
+    remaining = list(range(len(candidates)))
+
+    while len(selected_indices) < top_k and remaining:
+        best_idx: int | None = None
+        best_score = float("-inf")
+
+        for i in remaining:
+            relevance = candidates[i].score / max_score
+            if not selected_indices:
+                mmr_score = relevance
+            else:
+                max_sim = max(_jaccard(tokens[i], tokens[j]) for j in selected_indices)
+                mmr_score = lambda_ * relevance - (1 - lambda_) * max_sim
+
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = i
+
+        selected_indices.append(best_idx)
+        remaining.remove(best_idx)
+
+    return [candidates[i] for i in selected_indices]
+
+
+def _lost_in_middle_reorder(results: list[SearchResult]) -> list[SearchResult]:
+    """
+    Reorder so highest-scored docs are at the ends of the list.
+    Position 0 → rank 1, position -1 → rank 2, position 1 → rank 3, etc.
+    (alternating outside-in fill)
+
+    LLMs attend poorly to context in the middle of a long list. Placing
+    the most relevant documents at the start and end maximises the chance
+    that the model reads them.
+    """
+    if not results:
+        return results
+
+    # Results are assumed already sorted by descending score (RRF or MMR order)
+    reordered: list[SearchResult | None] = [None] * len(results)
+    left, right = 0, len(results) - 1
+    fill_left = True
+
+    for doc in results:
+        if fill_left:
+            reordered[left] = doc
+            left += 1
+        else:
+            reordered[right] = doc
+            right -= 1
+        fill_left = not fill_left
+
+    return [r for r in reordered if r is not None]
+
+
+# ── Feature-flag helpers ─────────────────────────────────────────────────────
+
+def _mmr_enabled() -> bool:
+    return os.getenv("MMR_ENABLED", "false").lower() in ("1", "true", "yes")
+
+
+def _mmr_lambda() -> float:
+    try:
+        return float(os.getenv("MMR_LAMBDA", "0.5"))
+    except ValueError:
+        return 0.5
+
+
+def _litm_enabled() -> bool:
+    return os.getenv("LITM_ENABLED", "false").lower() in ("1", "true", "yes")
+
+
+def _compression_enabled() -> bool:
+    return os.getenv("COMPRESSION_ENABLED", "false").lower() in ("1", "true", "yes")
+
+
 class ParallelRetriever:
     """
     Concurrent hybrid retriever with RRF fusion and per-source timeout.
@@ -89,6 +217,11 @@ class ParallelRetriever:
         self.dense = DenseRetriever()
         self.graph = GraphRetriever()
         self.timeout = timeout
+        # Per-retriever circuit breakers
+        self._breakers: dict[str, CircuitBreaker] = {
+            name: get_circuit_breaker(name)
+            for name in ("bm25", "dense", "graph")
+        }
 
     async def _timed_search(
         self,
@@ -97,13 +230,22 @@ class ParallelRetriever:
         query: str,
         top_k: int,
     ) -> _SourceResult:
-        """Run one retriever with timeout; return a _SourceResult regardless of outcome."""
+        """Run one retriever with timeout and circuit breaker; return a _SourceResult regardless of outcome."""
         start = time.monotonic()
+        breaker = self._breakers.get(name)
         try:
-            results = await asyncio.wait_for(
-                retriever.search(query, top_k), timeout=self.timeout
-            )
+            if breaker is not None:
+                results = await breaker.call(
+                    asyncio.wait_for(retriever.search(query, top_k), timeout=self.timeout)
+                )
+            else:
+                results = await asyncio.wait_for(
+                    retriever.search(query, top_k), timeout=self.timeout
+                )
             return _SourceResult(name=name, results=results, latency=time.monotonic() - start, error=None)
+        except CircuitOpenError:
+            logger.warning("circuit_open", source=name)
+            return _SourceResult(name=name, results=[], latency=0.0, error="circuit_open")
         except TimeoutError:
             elapsed = time.monotonic() - start
             logger.warning("retriever_timeout", source=name, timeout=self.timeout)
@@ -140,13 +282,38 @@ class ParallelRetriever:
         if failures:
             logger.warning("retriever_failures", sources=failures)
 
-        merged = _rrf_merge(source_results)[:top_k]
+        candidates = _rrf_merge(source_results)
 
-        logger.info(
-            "parallel_retrieval_complete",
+        # Apply MMR if enabled
+        if _mmr_enabled():
+            lambda_ = _mmr_lambda()
+            merged = _mmr(candidates, top_k=top_k, lambda_=lambda_)
+            mmr_on = True
+        else:
+            merged = candidates[:top_k]
+            mmr_on = False
+            lambda_ = None
+
+        # Apply Lost-in-the-Middle reordering if enabled
+        litm_on = _litm_enabled()
+        if litm_on:
+            merged = _lost_in_middle_reorder(merged)
+
+        # Apply contextual compression if enabled
+        if _compression_enabled():
+            from src.retrieval.compressor import get_compressor
+            merged = await get_compressor().compress_batch(query, merged)
+
+        log_kwargs: dict = dict(
             total_results=len(merged),
             per_source_counts={sr.name: len(sr.results) for sr in source_results},
             per_source_latency={sr.name: round(sr.latency, 3) for sr in source_results},
             failures=failures,
+            mmr_enabled=mmr_on,
+            litm_enabled=litm_on,
         )
+        if mmr_on and lambda_ is not None:
+            log_kwargs["mmr_lambda"] = lambda_
+
+        logger.info("parallel_retrieval_complete", **log_kwargs)
         return merged

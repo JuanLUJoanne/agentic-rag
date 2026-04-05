@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.retrieval.circuit_breaker import CircuitOpenError
 from src.retrieval.models import SearchResult
-from src.retrieval.parallel_retriever import ParallelRetriever, _rrf_merge, _SourceResult
+from src.retrieval.parallel_retriever import (
+    ParallelRetriever,
+    _lost_in_middle_reorder,
+    _rrf_merge,
+    _SourceResult,
+)
 
 # ── _rrf_merge pure-function tests ─────────────────────────────────────────────
 
@@ -212,3 +219,126 @@ async def test_rrf_boost_visible_in_retrieve():
 
     results = await pr.retrieve("query", query_type="simple", top_k=5)
     assert results[0].doc_id == "tech_01"
+
+
+# ── Lost-in-the-Middle tests ──────────────────────────────────────────────────
+
+
+def _make_docs(n: int) -> list[SearchResult]:
+    """Create n docs with descending scores (rank 0 = highest)."""
+    return [
+        SearchResult(
+            doc_id=f"d{i}",
+            content=f"document content {i}",
+            score=1.0 - i * 0.1,
+            source="rrf_merged",
+        )
+        for i in range(n)
+    ]
+
+
+def test_litm_empty_list():
+    assert _lost_in_middle_reorder([]) == []
+
+
+def test_litm_single_doc():
+    docs = _make_docs(1)
+    assert _lost_in_middle_reorder(docs) == docs
+
+
+def test_litm_highest_at_index_0_and_last():
+    """With 4 docs (scores 1.0, 0.9, 0.8, 0.7), highest (d0) → pos 0, second (d1) → pos -1."""
+    docs = _make_docs(4)
+    reordered = _lost_in_middle_reorder(docs)
+    assert reordered[0].doc_id == "d0"   # rank 1 → position 0
+    assert reordered[-1].doc_id == "d1"  # rank 2 → position -1
+
+
+def test_litm_preserves_all_docs():
+    docs = _make_docs(6)
+    reordered = _lost_in_middle_reorder(docs)
+    assert len(reordered) == len(docs)
+    assert {r.doc_id for r in reordered} == {r.doc_id for r in docs}
+
+
+@pytest.mark.asyncio
+async def test_litm_disabled_by_default(monkeypatch):
+    """LITM_ENABLED defaults to false — output order follows RRF (not LITM reorder)."""
+    monkeypatch.delenv("LITM_ENABLED", raising=False)
+    monkeypatch.delenv("MMR_ENABLED", raising=False)
+
+    pr = ParallelRetriever()
+
+    # Inject deterministic docs: d0 (score 0.9) appears in both sources → RRF rank 1
+    shared = SearchResult(doc_id="d0", content="shared", score=0.9, source="bm25")
+    other = SearchResult(doc_id="d1", content="other", score=0.5, source="bm25")
+
+    async def mock_bm25(q, top_k=10):
+        return [shared, other]
+
+    async def mock_dense(q, top_k=10):
+        return [SearchResult(doc_id="d0", content="shared", score=0.88, source="dense")]
+
+    pr.bm25.search = mock_bm25
+    pr.dense.search = mock_dense
+
+    results = await pr.retrieve("query", query_type="simple", top_k=5)
+    # Without LITM, RRF order: d0 first (cross-source boost)
+    assert results[0].doc_id == "d0"
+
+
+@pytest.mark.asyncio
+async def test_litm_enabled_reorders_ends(monkeypatch):
+    """With LITM_ENABLED=true, highest-score doc is at index 0, second at index -1."""
+    monkeypatch.setenv("LITM_ENABLED", "true")
+    monkeypatch.delenv("MMR_ENABLED", raising=False)
+
+    pr = ParallelRetriever()
+
+    # Inject 4 docs with known RRF ranking: d0 > d1 > d2 > d3
+    docs = [
+        SearchResult(doc_id=f"d{i}", content=f"doc {i}", score=1.0 - i * 0.1, source="bm25")
+        for i in range(4)
+    ]
+
+    async def mock_bm25(q, top_k=10):
+        return docs
+
+    async def mock_dense(q, top_k=10):
+        return []
+
+    pr.bm25.search = mock_bm25
+    pr.dense.search = mock_dense
+
+    results = await pr.retrieve("query", query_type="simple", top_k=4)
+    assert len(results) == 4
+    assert results[0].doc_id == "d0"   # highest score at start
+    assert results[-1].doc_id == "d1"  # second highest at end
+
+
+# ── Circuit breaker integration tests ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_open_treated_as_source_failure(monkeypatch):
+    """When the circuit breaker raises CircuitOpenError, the source returns empty + error='circuit_open'."""
+    pr = ParallelRetriever()
+
+    # Replace the bm25 circuit breaker with one that always raises CircuitOpenError
+    mock_breaker = MagicMock()
+    mock_breaker.call = AsyncMock(side_effect=CircuitOpenError("circuit is open"))
+    pr._breakers["bm25"] = mock_breaker
+
+    # Dense still works normally
+    async def mock_dense(q, top_k=10):
+        return [SearchResult(doc_id="d1", content="dense result", score=0.8, source="dense")]
+
+    pr.dense.search = mock_dense
+
+    results = await pr.retrieve("query", query_type="simple", top_k=5)
+
+    # The pipeline should complete — dense results come through
+    assert isinstance(results, list)
+    # bm25 contributed nothing (circuit was open)
+    bm25_ids = {r.doc_id for r in results if r.source == "bm25"}
+    assert len(bm25_ids) == 0
