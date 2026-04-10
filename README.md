@@ -39,6 +39,11 @@ Corrective RAG:
     retrieve → grade_docs → [all_relevant] → generate → hallucination_check
                           → [partial]      → rewrite_query ──► retrieve (once)
                           → [none]         → web_search ──► generate
+
+    The rewrite_query loop is the multi-hop layer: when the first retrieval pass
+    returns insufficient evidence, the query is reformulated using graded context
+    and re-issued — covering iterative reasoning chains without a separate
+    multi-hop pipeline.
 ```
 
 ---
@@ -54,9 +59,10 @@ Two patterns are benchmarked in depth. The remaining 8 are listed in [Also Imple
 **`src/retrieval/parallel_retriever.py` · `ParallelRetriever` · `_rrf_merge`**
 
 ```
-asyncio.gather ──► BM25Retriever  (5s timeout, circuit breaker)  ──┐
-                ──► DenseRetriever (5s timeout, circuit breaker) ──┤──► _rrf_merge(k=60) ──► MMR ──► LITM ──► Compression ──► top-k
-                ──► GraphRetriever (5s timeout, circuit breaker) ──┘   (complex queries only)
+asyncio.gather ──► BM25Retriever           (5s timeout, circuit breaker)  ──┐
+                ──► DenseRetriever          (5s timeout, circuit breaker)  ──┤
+                ──► GraphRetriever          (5s timeout, circuit breaker)  ──┤──► _rrf_merge(k=60) ──► Cross-Encoder ──► MMR ──► LITM ──► Compression ──► top-k
+                ──► MultiGranularityRetriever (sentence→paragraph expand)  ──┘   (opt-in per source via env flag)
 ```
 
 **Why RRF over linear score combination?**
@@ -68,6 +74,8 @@ BM25 scores are unbounded integers; cosine similarities are 0–1. Combining the
 
 | Stage | Flag | Decision |
 |---|---|---|
+| **Multi-granularity** (`multi_granularity_retriever.py`) | `MULTI_GRANULARITY_ENABLED=true` | Sentence-level BM25 index for precision; hits expanded to parent paragraphs for LLM context (parent-child strategy). Runs as a fourth parallel source in `asyncio.gather` — zero added wall-clock latency. Score normalisation handled by RRF (rank positions only, no cross-granularity calibration) |
+| **Cross-Encoder reranking** (`_cross_encoder_rerank`) | `RERANKER_ENABLED=true`, `RERANKER_MODEL` | Jointly encodes (query, doc) pairs for higher-precision scoring than bi-encoder cosine similarity. Runs in a thread executor to avoid blocking the event loop. Applied before MMR so diversity selection operates on precise scores |
 | **MMR** (`_mmr`) | `MMR_ENABLED=true`, `MMR_LAMBDA` | Removes near-duplicate results using Jaccard token overlap as similarity proxy — no embedding required, works with BM25-only mode. λ=0.5 default; raise to 0.7 for precision-sensitive domains (legal, medical) |
 | **Lost-in-the-Middle** (`_lost_in_middle_reorder`) | `LITM_ENABLED=true` | Reorders so highest-scored docs land at position 0 and -1. LLMs have documented attention bias away from the middle of long context; 3–5% quality gain at zero cost |
 | **Contextual Compression** (`compressor.py`) | `COMPRESSION_ENABLED=true` | LLM extracts only query-relevant sentences from each retrieved doc. Reduces context tokens by ~80% on verbose sources; skipped automatically in DummyLLM mode |
@@ -390,7 +398,7 @@ scripts/
 | Distributed Tracing | OpenTelemetry SDK → OTLP / Jaeger / Tempo |
 | Metrics | Prometheus (`prometheus-client`), Grafana-compatible |
 | Retrieval | BM25 (rank-bm25), sentence-transformers (dense), custom graph |
-| Post-retrieval | MMR (Jaccard proxy), Lost-in-the-Middle, contextual compression |
+| Post-retrieval | Multi-granularity (parent-child), Cross-Encoder reranking, MMR (Jaccard proxy), Lost-in-the-Middle, contextual compression |
 | Reliability | Per-retriever circuit breakers, exponential backoff + jitter |
 | Vector store | pgvector (PostgreSQL) |
 | Graph store | Neo4j |
@@ -401,7 +409,7 @@ scripts/
 | Persistence | SQLite (cache, memory, prompt store, audit) |
 | Multi-tenancy | Per-tenant token bucket rate limiter + cost budget |
 | Experimentation | A/B testing framework (deterministic sha256 assignment) |
-| Testing | pytest + pytest-asyncio (335 tests, all runnable offline) |
+| Testing | pytest + pytest-asyncio (366 tests, all runnable offline) |
 | Linting | ruff |
 | CI | GitHub Actions (Python 3.11/3.12 matrix) |
 | Container | Docker + docker-compose (PostgreSQL, Neo4j, API) |
