@@ -29,6 +29,13 @@ Design choices:
     each document for higher-precision scoring than bi-encoder cosine similarity.
     Runs as a blocking CPU call in a thread executor to avoid stalling the event
     loop. Set RERANKER_MODEL to override the model name.
+  - Multi-granularity retrieval (opt-in via MULTI_GRANULARITY_ENABLED=true):
+    indexes sentence-level chunks and expands hits to their parent paragraphs
+    at query time (parent-child strategy). Sentence-level retrieval gives
+    precision; paragraph-level content gives the LLM the context it needs.
+    Runs as a fourth parallel source inside asyncio.gather — no added latency
+    vs. running without it. Score normalisation across granularities is handled
+    by RRF (rank positions only, no raw-score calibration needed).
 """
 from __future__ import annotations
 
@@ -216,6 +223,10 @@ def _reranker_model() -> str:
     return os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
+def _multi_granularity_enabled() -> bool:
+    return os.getenv("MULTI_GRANULARITY_ENABLED", "false").lower() in ("1", "true", "yes")
+
+
 def _load_cross_encoder(model_name: str):
     """
     Load and return a CrossEncoder instance.
@@ -296,10 +307,15 @@ class ParallelRetriever:
         self.dense = DenseRetriever()
         self.graph = GraphRetriever()
         self.timeout = timeout
+        # Multi-granularity retriever — always initialised; only used when
+        # MULTI_GRANULARITY_ENABLED=true so the index cost is paid upfront.
+        from src.retrieval.multi_granularity_retriever import MultiGranularityRetriever
+        self.multi_gran = MultiGranularityRetriever()
+        self.multi_gran.index(SAMPLE_DOCS)
         # Per-retriever circuit breakers
         self._breakers: dict[str, CircuitBreaker] = {
             name: get_circuit_breaker(name)
-            for name in ("bm25", "dense", "graph")
+            for name in ("bm25", "dense", "graph", "multi_gran")
         }
 
     async def _timed_search(
@@ -352,6 +368,10 @@ class ParallelRetriever:
         ]
         if query_type == "complex":
             retrievers.append(("graph", self.graph, top_k))
+        if _multi_granularity_enabled():
+            # Sentence-level search + parent expansion; runs in parallel with
+            # BM25/Dense so adds zero wall-clock latency to asyncio.gather.
+            retrievers.append(("multi_gran", self.multi_gran, top_k * 2))
 
         source_results: list[_SourceResult] = await asyncio.gather(
             *[self._timed_search(name, r, query, k) for name, r, k in retrievers]
@@ -399,6 +419,7 @@ class ParallelRetriever:
             reranker_enabled=reranker_on,
             mmr_enabled=mmr_on,
             litm_enabled=litm_on,
+            multi_granularity_enabled=_multi_granularity_enabled(),
         )
         if mmr_on and lambda_ is not None:
             log_kwargs["mmr_lambda"] = lambda_
