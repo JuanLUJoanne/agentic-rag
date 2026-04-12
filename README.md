@@ -272,8 +272,18 @@ Three-layer pipeline ensuring personal data never reaches external APIs unredact
 | **3 — Output scan** | `gateway/output_scanner.py` `OutputScanner` | Scans generated text after the LLM returns; catches context leakage and hallucinated PII |
 
 **Detection backends** (with graceful degradation):
-- **Presidio + spaCy** (`pip install -e ".[pii]"` then `python -m spacy download en_core_web_lg`) — NER-based detection for PERSON, LOCATION, DATE_OF_BIRTH plus all regex types
-- **Regex fallback** (always active, zero extra deps) — EMAIL, PHONE, CREDIT_CARD, IP_ADDRESS, AU identifiers, and a PERSON heuristic (Title-Case word pairs)
+- **Presidio + spaCy** (`pip install -e ".[pii]"` then `python -m spacy download en_core_web_lg`) — NER-based detection for PERSON, LOCATION, DATE_OF_BIRTH; tries `en_core_web_lg` first, falls back to `en_core_web_sm`. Custom `PatternRecognizer` instances register AU_MEDICARE, AU_TFN, AU_ABN into the Presidio engine (gaps in its built-in coverage).
+- **Regex fallback** (always active, zero extra deps) — EMAIL, PHONE, CREDIT_CARD, IP_ADDRESS, AU identifiers, and a PERSON heuristic (Title-Case word pairs, confidence 0.75). Active whenever Presidio is not installed or fails to initialise.
+
+**Redaction options** (`PIIDetector(redaction_style=...)`):
+
+| Style | Output | Reversible |
+|---|---|---|
+| `"placeholder"` (default) | `[PERSON_1]`, `[EMAIL_2]` | ✓ via `redaction_map` property |
+| `"hash"` | `[PERSON:a1b2c3d4]` | ✗ (sha256 prefix) |
+| `"mask"` | `***` | ✗ (hides length too) |
+
+`confidence_threshold` (default 0.7) and `allow_list` filter noise and whitelist known company/product names before redaction.
 
 **Compliance audit trail**: every PII event is appended to `data/audit.jsonl` with `event_type`, `pii_types`, `pii_count`, `action_taken`.  Query the report endpoint:
 
