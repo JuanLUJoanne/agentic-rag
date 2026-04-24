@@ -13,14 +13,24 @@ Batch 4 adds production hardening:
 Batch 5 adds observability:
   - supervisor_node instrumented with an OTel child span.
 
+Batch 6 upgrades:
+  - research_agent replaced with a LangGraph subgraph (retrieve → grade →
+    rewrite loop → synthesize) for multi-step retrieval.
+  - Parallel dispatch via asyncio.gather when supervisor returns
+    ``next_agents`` list (e.g. research + analysis concurrently).
+    Latency = max(agent_latencies) instead of sum(agent_latencies).
+
 Graph topology:
-  sanitize_input ──► memory_check ──► supervisor ──► research_agent ──┐
-       │ injection         │ hit             ▲        analysis_agent ──┤
-       └──► finalize       └──► finalize     └────────quality_agent  ──┘
-                                                      human_review   ──► finalize ──► audit_log ──► END
+  sanitize_input ──► memory_check ──► supervisor ──┬──► research_agent ──► supervisor
+       │ injection         │ hit             ▲     ├──► analysis_agent ──► supervisor
+       └──► finalize       └──► finalize     │     ├──► quality_agent  ──► supervisor
+                                             │     └──► parallel_dispatch ──► supervisor
+                                             │              (asyncio.gather: research + analysis)
+                                             └───────── human_review ──► finalize ──► audit_log ──► END
 """
 from __future__ import annotations
 
+import asyncio
 import operator
 from typing import Annotated, Literal
 
@@ -35,6 +45,11 @@ from src.agents.research_agent import ResearchAgent
 from src.agents.supervisor import Supervisor
 from src.gateway.cost_tracker import get_default_tracker
 from src.gateway.rate_limiter import get_default_rate_limiter
+from src.graph.research_subgraph import (
+    from_research_state,
+    research_compiled,
+    to_research_state,
+)
 from src.graph.simple_workflow import (
     audit_log,
     finalize,
@@ -94,13 +109,17 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
 
 async def research_agent_node(state: SupervisorState) -> dict:
-    """LangGraph node: delegate to ResearchAgent and record the dispatch."""
+    """LangGraph node: run the research subgraph (retrieve → grade → rewrite loop → synthesize)."""
     await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
-    result = await ResearchAgent().execute(state)
+
+    # Map outer state → subgraph state, run subgraph, map results back
+    research_state = to_research_state(state)
+    result = await research_compiled.ainvoke(research_state)
+    outer_result = from_research_state(result)
+
     _record_agent_cost(model_id="gpt-4o-mini", input_t=300, output_t=200, state=state)
     return {
-        **result,
-        "agents_called": ["research"],
+        **outer_result,
         "iteration_count": state.get("iteration_count", 0) + 1,
     }
 
@@ -126,6 +145,96 @@ async def quality_agent_node(state: SupervisorState) -> dict:
         **result,
         "agents_called": ["quality"],
         "iteration_count": state.get("iteration_count", 0) + 1,
+    }
+
+
+async def parallel_dispatch_node(state: SupervisorState) -> dict:
+    """LangGraph node: run multiple agents concurrently via asyncio.gather.
+
+    When the supervisor returns ``next_agents: ["research", "analysis"]``,
+    this node runs both agents in parallel.  Latency becomes
+    max(research_latency, analysis_latency) instead of sum.
+
+    Uses asyncio.gather rather than LangGraph's Send() API because Send
+    requires all parallel-written state fields to have Annotated reducers —
+    asyncio.gather lets us merge results in application code without
+    restructuring the entire state schema.
+    """
+    decision = state.get("supervisor_decision") or {}
+    next_agents = decision.get("next_agents", [])
+
+    agent_map = {
+        "research": _run_research,
+        "analysis": _run_analysis,
+    }
+
+    tasks = []
+    for agent_name in next_agents:
+        runner = agent_map.get(agent_name)
+        if runner:
+            tasks.append(runner(state))
+
+    if not tasks:
+        logger.warning("parallel_dispatch_no_valid_agents", next_agents=next_agents)
+        return {"agent_trace": [{"node": "parallel_dispatch", "agents": []}]}
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Merge results: combine all agent outputs
+    merged: dict = {
+        "agents_called": [],
+        "agent_trace": [{"node": "parallel_dispatch", "agents": list(next_agents)}],
+    }
+    iteration_increment = 0
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            agent_name = next_agents[i] if i < len(next_agents) else "unknown"
+            logger.warning("parallel_agent_failed", agent=agent_name, error=str(result))
+            continue
+        # Merge state fields — later agents override earlier ones for scalar fields
+        for key, value in result.items():
+            if key == "agents_called":
+                merged["agents_called"].extend(value)
+            elif key == "agent_trace":
+                merged["agent_trace"].extend(value)
+            elif key == "iteration_count":
+                iteration_increment += 1
+            else:
+                merged[key] = value
+
+    # One supervisor decision → one iteration, regardless of how many agents ran
+    merged["iteration_count"] = state.get("iteration_count", 0) + 1
+
+    logger.info(
+        "parallel_dispatch_complete",
+        agents_dispatched=next_agents,
+        agents_succeeded=[
+            next_agents[i]
+            for i, r in enumerate(results)
+            if not isinstance(r, Exception) and i < len(next_agents)
+        ],
+    )
+    return merged
+
+
+async def _run_research(state: SupervisorState) -> dict:
+    """Run research subgraph (for parallel dispatch)."""
+    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
+    research_state = to_research_state(state)
+    result = await research_compiled.ainvoke(research_state)
+    outer_result = from_research_state(result)
+    _record_agent_cost(model_id="gpt-4o-mini", input_t=300, output_t=200, state=state)
+    return outer_result
+
+
+async def _run_analysis(state: SupervisorState) -> dict:
+    """Run analysis agent (for parallel dispatch)."""
+    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
+    result = await AnalysisAgent().execute(state)
+    _record_agent_cost(model_id="gpt-4o-mini", input_t=400, output_t=300, state=state)
+    return {
+        **result,
+        "agents_called": ["analysis"],
     }
 
 
@@ -208,15 +317,34 @@ def route_after_memory_check_ma(
 
 def route_supervisor(
     state: SupervisorState,
-) -> Literal["research_agent", "analysis_agent", "quality_agent", "human_review", "finalize"]:
+) -> Literal[
+    "research_agent", "analysis_agent", "quality_agent",
+    "parallel_dispatch", "human_review", "finalize",
+]:
     """
-    Translate the supervisor's next_agent decision into a graph edge.
+    Translate the supervisor's decision into a graph edge.
+
+    Supports two dispatch modes:
+      - Single agent: ``{"next_agent": "research"}`` → edge to "research_agent"
+      - Parallel: ``{"next_agents": ["research", "analysis"]}``
+        → edge to "parallel_dispatch" (asyncio.gather internally)
 
     'done' routes to human_review when quality < 0.7 (low-confidence answers
     need human sign-off), otherwise straight to finalize.
     """
     decision = state.get("supervisor_decision") or {}
-    next_agent = decision.get("next_agent", "done")
+
+    # ── Parallel dispatch ───────────────────────────────────────────────────
+    next_agents = decision.get("next_agents")
+    if next_agents and isinstance(next_agents, list) and len(next_agents) > 1:
+        return "parallel_dispatch"
+
+    # ── Single dispatch ─────────────────────────────────────────────────────
+    next_agent = decision.get("next_agent")
+
+    # Handle next_agents with single element
+    if not next_agent and next_agents and len(next_agents) == 1:
+        next_agent = next_agents[0]
 
     if next_agent == "research":
         return "research_agent"
@@ -246,6 +374,7 @@ def build_multi_agent_workflow() -> StateGraph:
     workflow.add_node("research_agent", research_agent_node)
     workflow.add_node("analysis_agent", analysis_agent_node)
     workflow.add_node("quality_agent", quality_agent_node)
+    workflow.add_node("parallel_dispatch", parallel_dispatch_node)
     workflow.add_node("human_review", human_review)
     workflow.add_node("finalize", finalize)
     workflow.add_node("audit_log", audit_log)
@@ -263,7 +392,7 @@ def build_multi_agent_workflow() -> StateGraph:
         {"finalize": "finalize", "supervisor": "supervisor"},
     )
 
-    # Supervisor branches to any specialist agent or terminates
+    # Supervisor branches to specialist agents, parallel dispatch, or terminates
     workflow.add_conditional_edges(
         "supervisor",
         route_supervisor,
@@ -271,15 +400,17 @@ def build_multi_agent_workflow() -> StateGraph:
             "research_agent": "research_agent",
             "analysis_agent": "analysis_agent",
             "quality_agent": "quality_agent",
+            "parallel_dispatch": "parallel_dispatch",
             "human_review": "human_review",
             "finalize": "finalize",
         },
     )
 
-    # Every specialist agent reports back to the supervisor for the next decision
+    # Every dispatch path reports back to the supervisor for the next decision
     workflow.add_edge("research_agent", "supervisor")
     workflow.add_edge("analysis_agent", "supervisor")
     workflow.add_edge("quality_agent", "supervisor")
+    workflow.add_edge("parallel_dispatch", "supervisor")
 
     # Human review passes through to finalize (resume handled in Batch 5)
     workflow.add_edge("human_review", "finalize")

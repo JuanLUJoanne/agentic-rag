@@ -48,9 +48,9 @@ def _state(**kwargs) -> dict:
 
 @pytest.mark.asyncio
 async def test_supervisor_picks_research_first(supervisor):
-    """New query with no agents called → dispatch research."""
+    """New query with no agents called → parallel dispatch research + analysis."""
     decision = await supervisor.decide(_state())
-    assert decision["next_agent"] == "research"
+    assert decision["next_agents"] == ["research", "analysis"]
 
 
 @pytest.mark.asyncio
@@ -108,10 +108,10 @@ async def test_supervisor_stops_at_max_iterations(supervisor):
 async def test_supervisor_stops_before_max_iterations(supervisor):
     """iteration_count < max_iterations should NOT trigger the guard."""
     decision = await supervisor.decide(_state(iteration_count=4))
-    assert decision["next_agent"] != "done" or decision["next_agent"] == "done"
+    next_agent = decision.get("next_agent")
     # Just verify it doesn't erroneously fire the guard at iteration 4
     # (it may be "done" for other reasons, so we just check the guard reasoning)
-    if decision["next_agent"] == "done":
+    if next_agent == "done":
         assert "max_iterations" not in decision["reasoning"]
 
 
@@ -127,8 +127,8 @@ async def test_supervisor_stops_on_budget_exceeded(supervisor):
 async def test_supervisor_budget_not_triggered_below_limit(supervisor):
     """cost_so_far < budget must not trigger budget guard."""
     decision = await supervisor.decide(_state(cost_so_far=0.01))
-    # Should proceed with normal dispatch (research first in dummy mode)
-    assert decision["next_agent"] == "research"
+    # Should proceed with normal dispatch (parallel research+analysis in dummy mode)
+    assert decision.get("next_agents") == ["research", "analysis"]
 
 
 # ── Decision structure ─────────────────────────────────────────────────────────
@@ -137,7 +137,8 @@ async def test_supervisor_budget_not_triggered_below_limit(supervisor):
 @pytest.mark.asyncio
 async def test_supervisor_decision_has_required_keys(supervisor):
     decision = await supervisor.decide(_state())
-    assert "next_agent" in decision
+    # First call returns parallel dispatch (next_agents) instead of next_agent
+    assert "next_agents" in decision or "next_agent" in decision
     assert "required_skill" in decision
     assert "reasoning" in decision
 
@@ -145,4 +146,4 @@ async def test_supervisor_decision_has_required_keys(supervisor):
 @pytest.mark.asyncio
 async def test_supervisor_research_decision_has_skill(supervisor):
     decision = await supervisor.decide(_state())
-    assert decision["required_skill"]  # non-empty skill for agent dispatch
+    assert decision["required_skill"]  # non-empty skill for parallel dispatch

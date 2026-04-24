@@ -62,6 +62,36 @@ def test_route_supervisor_missing_decision():
     assert route_supervisor(state) == "finalize"
 
 
+# ── Parallel dispatch routing tests ──────────────────────────────────────────
+
+
+def test_route_supervisor_parallel_dispatch():
+    """next_agents with multiple agents → parallel_dispatch."""
+    state = {
+        "supervisor_decision": {"next_agents": ["research", "analysis"]},
+        "answer_quality": None,
+    }
+    assert route_supervisor(state) == "parallel_dispatch"
+
+
+def test_route_supervisor_single_next_agents():
+    """next_agents with single agent → direct dispatch, not parallel."""
+    state = {
+        "supervisor_decision": {"next_agents": ["research"]},
+        "answer_quality": None,
+    }
+    assert route_supervisor(state) == "research_agent"
+
+
+def test_route_supervisor_next_agents_empty():
+    """Empty next_agents falls through to finalize."""
+    state = {
+        "supervisor_decision": {"next_agents": []},
+        "answer_quality": None,
+    }
+    assert route_supervisor(state) == "finalize"
+
+
 # ── End-to-end workflow tests ──────────────────────────────────────────────────
 
 
@@ -79,7 +109,7 @@ async def test_multi_agent_end_to_end():
 
 @pytest.mark.asyncio
 async def test_multi_agent_all_agents_called():
-    """DummyLLM sequence must dispatch research → analysis → quality."""
+    """DummyLLM sequence must dispatch research, analysis, and quality."""
     state = get_initial_supervisor_state("What is RAG?")
     config = {"configurable": {"thread_id": f"test-ma-{uuid.uuid4()}"}}
 
@@ -93,14 +123,17 @@ async def test_multi_agent_all_agents_called():
 
 @pytest.mark.asyncio
 async def test_multi_agent_iteration_count_increments():
-    """iteration_count should equal the number of agent dispatches."""
+    """iteration_count should track supervisor dispatch steps.
+
+    With parallel dispatch: parallel(research+analysis)=1 step, quality=1 step → 2 total.
+    """
     state = get_initial_supervisor_state("What is corrective RAG?")
     config = {"configurable": {"thread_id": f"test-ma-{uuid.uuid4()}"}}
 
     final = await multi_agent_graph.ainvoke(state, config=config)
 
-    # 3 agents dispatched → iteration_count == 3
-    assert final.get("iteration_count") == 3
+    # parallel(research+analysis) + quality = 2 dispatch steps
+    assert final.get("iteration_count") == 2
 
 
 @pytest.mark.asyncio
@@ -117,6 +150,18 @@ async def test_multi_agent_trace_populated():
     assert "analysis_agent" in trace_nodes
     assert "quality_agent" in trace_nodes
     assert "finalize" in trace_nodes
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_trace_has_parallel_dispatch():
+    """Parallel dispatch should appear in agent_trace."""
+    state = get_initial_supervisor_state("What is BM25?")
+    config = {"configurable": {"thread_id": f"test-ma-{uuid.uuid4()}"}}
+
+    final = await multi_agent_graph.ainvoke(state, config=config)
+
+    trace_nodes = {step["node"] for step in final.get("agent_trace", [])}
+    assert "parallel_dispatch" in trace_nodes
 
 
 @pytest.mark.asyncio

@@ -43,11 +43,14 @@ Current state:
 - answer generated: {has_answer}
 - quality score: {quality_score}
 
-Decide which agent to dispatch next, or declare done if the answer is ready.
+Decide which agent(s) to dispatch next, or declare done if the answer is ready.
 Respond with valid JSON only — no explanation outside the JSON block.
 
-If dispatching an agent:
+If dispatching a single agent:
 {{"next_agent": "<agent_name>", "required_skill": "<skill>", "reasoning": "<one sentence>"}}
+
+If dispatching multiple agents in parallel:
+{{"next_agents": ["<agent1>", "<agent2>"], "required_skill": "<skill>", "reasoning": "<one sentence>"}}
 
 If finished:
 {{"next_agent": "done", "required_skill": "", "reasoning": "<one sentence>"}}"""
@@ -128,6 +131,7 @@ class Supervisor:
         logger.info(
             "supervisor_decision",
             next_agent=decision.get("next_agent"),
+            next_agents=decision.get("next_agents"),
             skill=decision.get("required_skill", ""),
             reasoning=decision.get("reasoning", "")[:100],
         )
@@ -142,16 +146,30 @@ class Supervisor:
         Follows research → analysis → quality → done regardless of state
         quality, because DummyLLM always produces valid-looking results.
         Checks agents_called so it never re-dispatches a completed agent.
+
+        Parallel fan-out: when both research and analysis are pending, returns
+        ``next_agents`` list so the graph can dispatch them concurrently via
+        Send().  When only one is pending, falls back to single ``next_agent``.
         """
         agents_called: list[str] = state.get("agents_called", [])
+        need_research = "research" not in agents_called
+        need_analysis = "analysis" not in agents_called
 
-        if "research" not in agents_called:
+        # Parallel fan-out: research + analysis can run concurrently
+        if need_research and need_analysis:
+            return {
+                "next_agents": ["research", "analysis"],
+                "required_skill": "document_retrieval,grounded_generation",
+                "reasoning": "Research and analysis are independent; dispatch in parallel",
+            }
+
+        if need_research:
             return {
                 "next_agent": "research",
                 "required_skill": "document_retrieval",
                 "reasoning": "Need to retrieve relevant documents before generating an answer",
             }
-        if "analysis" not in agents_called:
+        if need_analysis:
             return {
                 "next_agent": "analysis",
                 "required_skill": "grounded_generation",
