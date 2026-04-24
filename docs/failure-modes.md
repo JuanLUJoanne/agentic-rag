@@ -49,6 +49,17 @@
 - Misroute cost: **+2 extra agent dispatches** (analysis + quality) for 30% of queries
 - Supervisor decision latency (DummyLLM): **0.04 ms** — real LLM adds ~500–1000 ms per decision
 
+### Parallel Dispatch Failures
+
+| Failure | Trigger | Impact | Recovery |
+|---------|---------|--------|----------|
+| One parallel agent raises exception | Bug in ResearchAgent or AnalysisAgent | `asyncio.gather(return_exceptions=True)` captures the error; the other agent's result is still merged | Failed agent's result logged as error; supervisor can re-dispatch on the next iteration |
+| Research subgraph rewrite loop exhausted | All retrieved docs graded as irrelevant after 2 rewrites | Subgraph proceeds to `synthesize` with best-effort documents | `max_rewrites=2` cap prevents infinite loops; synthesis uses whatever docs are available |
+| Research subgraph grade_relevance wrong | Grader marks relevant docs as irrelevant (or vice versa) | Unnecessary rewrite (wasted latency) or skipped rewrite (lower quality) | QualityAgent downstream catches low-quality answers; human review path for persistent issues |
+| Parallel merge conflict on scalar fields | Both agents return `generation` | `parallel_dispatch_node` uses last-write-wins for scalar fields | Research result takes priority for `retrieved_docs`; analysis result takes priority for `generation` — matching their respective responsibilities |
+
+---
+
 **When NOT to use the supervisor:**
 
 Simple factual queries are better served by the Simple Corrective RAG pipeline:

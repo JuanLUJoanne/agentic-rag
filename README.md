@@ -28,8 +28,18 @@ QueryRouter ────[simple]────► Corrective RAG pipeline
     ▼
 Supervisor (LLM or DummyLLM)
     │ reads AgentRegistry capabilities dynamically
-    ├──► ResearchAgent  (parallel BM25 + Dense + Graph retrieval, RRF merge)
-    ├──► AnalysisAgent  (grounded generation + citation extraction)
+    │
+    │ ┌─ parallel_dispatch (asyncio.gather) ─────────────────────┐
+    │ │                                                          │
+    │ ├──► ResearchSubgraph ──────────────────────────────────┐  │
+    │ │      retrieve → grade_relevance                       │  │
+    │ │        ├─[all_relevant]──► synthesize ─► ◄────────────┘  │
+    │ │        └─[partial/none]──► rewrite_query (max 2×) ──►    │
+    │ │                            re-retrieve ──► synthesize    │
+    │ │                                                          │
+    │ ├──► AnalysisAgent  (grounded generation + citation)       │
+    │ └─────────────────────────────────────────────────────────┘
+    │
     └──► QualityAgent   (hallucination check, faithfulness score)
               │
               ├──[quality ≥ 0.7]──► Finalize ──► AuditLog ──► SSE stream
@@ -99,22 +109,35 @@ Run `PYTHONPATH=. python scripts/benchmark_rrf_sensitivity.py` to populate with 
 
 ### Pattern 4 — Supervisor Multi-Agent Orchestration
 
-**`src/agents/supervisor.py` · `Supervisor` · `src/graph/multi_agent_workflow.py`**
+**`src/agents/supervisor.py` · `Supervisor` · `src/graph/multi_agent_workflow.py` · `src/graph/research_subgraph.py`**
 
 ```
 supervisor ──► AgentRegistry.get_all_capabilities()
      │               (dynamic prompt injection)
-     ├──► research_agent  ──► supervisor  (loop back)
-     ├──► analysis_agent  ──► supervisor
-     ├──► quality_agent   ──► supervisor
+     │
+     ├──► parallel_dispatch ─┬──► research_subgraph ──┐
+     │                       └──► analysis_agent ──────┤──► supervisor (loop back)
+     │                           (asyncio.gather)      │
+     ├──► quality_agent ──────────────────────────────►│
      └──► done ──► finalize
 ```
+
+**Research subgraph** (`research_subgraph.py`): replaces the single-call research agent with a multi-step LangGraph subgraph:
+
+```
+retrieve → grade_relevance → [all_relevant] → synthesize → END
+                            → [partial/none] → rewrite_query → retrieve (max 2 rewrites)
+```
+
+This is the **corrective retrieval loop** inside the multi-agent workflow — if the first retrieval pass returns low-relevance documents, the query is automatically reformulated and re-issued before synthesis, without requiring a full supervisor round-trip.
+
+**Parallel dispatch**: when the supervisor determines that research and analysis are independent (both not yet called), it returns `next_agents: ["research", "analysis"]` and a dedicated `parallel_dispatch_node` runs them concurrently via `asyncio.gather`. Latency drops from `sum(latencies)` to `max(latencies)` — typically 40-50% faster on the first dispatch cycle.
 
 **Why dynamic registry over hardcoded routing?**
 Adding a new agent requires one line: `registry.register(MyAgent())`. The supervisor prompt rebuilds automatically at decision time — no routing code changes. `find_by_skill()` enables capability-based dispatch rather than name-based hardcoding.
 
 **Three safety guards prevent runaway loops:**
-1. `max_iterations=5` — hard cap on total agent dispatches per query
+1. `max_iterations=5` — hard cap on total supervisor decisions per query
 2. `budget=0.05` — stops execution when `cost_so_far` exceeds the per-query limit
 3. `CostGuardrail` pre-flight — blocks dispatch if estimated token cost would breach per-request ceiling
 
@@ -385,13 +408,13 @@ src/
 ├── finetuning/      # Embedding FT and QLoRA+DPO stubs
 ├── gateway/         # Rate limiter (global + per-tenant), cost tracker, guardrails,
 │                    #   security, prompt version store
-├── graph/           # LangGraph workflows (simple + multi-agent)
+├── graph/           # LangGraph workflows (simple + multi-agent + research subgraph)
 ├── observability/   # OpenTelemetry tracing, Prometheus metrics
 ├── retrieval/       # BM25, dense, graph, parallel retriever (MMR + LITM + compression
 │                    #   + circuit breakers), cache, semantic cache, memory
 └── utils/           # LLM factory (DummyLLM ↔ OpenAI, exponential backoff)
 tests/
-└── unit/            # 335 tests, all runnable offline
+└── unit/            # 387 tests, all runnable offline
 scripts/
 └── demo.py          # End-to-end demo: 5 queries × 10 patterns
 ```
@@ -419,7 +442,7 @@ scripts/
 | Persistence | SQLite (cache, memory, prompt store, audit) |
 | Multi-tenancy | Per-tenant token bucket rate limiter + cost budget |
 | Experimentation | A/B testing framework (deterministic sha256 assignment) |
-| Testing | pytest + pytest-asyncio (366 tests, all runnable offline) |
+| Testing | pytest + pytest-asyncio (387 tests, all runnable offline) |
 | Linting | ruff |
 | CI | GitHub Actions (Python 3.11/3.12 matrix) |
 | Container | Docker + docker-compose (PostgreSQL, Neo4j, API) |
