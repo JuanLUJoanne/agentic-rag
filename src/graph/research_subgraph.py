@@ -24,8 +24,7 @@ insufficient evidence, the query is reformulated and re-issued.
 """
 from __future__ import annotations
 
-import operator
-from typing import Annotated, Literal
+from typing import Literal
 
 import structlog
 from langgraph.graph import END, StateGraph
@@ -33,7 +32,7 @@ from langgraph.graph import END, StateGraph
 from src.agents.relevance_grader import grade_documents
 from src.agents.retriever import retrieve
 from src.graph.state import AgentState
-from src.observability.tracing import get_tracer
+from src.observability.tracing import get_tracer, set_span_ok
 from src.utils.llm import DummyLLM, get_llm
 
 logger = structlog.get_logger()
@@ -58,11 +57,16 @@ class ResearchState(AgentState):
 
 async def _retrieve_node(state: ResearchState) -> dict:
     """Run parallel retrieval with OTel span."""
-    with get_tracer().start_as_current_span("research_retrieve"):
+    with get_tracer().start_as_current_span("research_retrieve") as span:
+        span.set_attribute("rag.query", state.get("query", "")[:100])
+        span.set_attribute("rewrite.count", state.get("rewrite_count", 0))
         result = await retrieve(state)
+        doc_count = len(result.get("retrieved_docs", []))
+        span.set_attribute("retrieval.doc_count", doc_count)
+        set_span_ok(span)
         logger.info(
             "research_subgraph_retrieve",
-            doc_count=len(result.get("retrieved_docs", [])),
+            doc_count=doc_count,
             rewrite_count=state.get("rewrite_count", 0),
         )
         return result
@@ -70,8 +74,12 @@ async def _retrieve_node(state: ResearchState) -> dict:
 
 async def _grade_node(state: ResearchState) -> dict:
     """Grade document relevance."""
-    with get_tracer().start_as_current_span("research_grade"):
-        return await grade_documents(state)
+    with get_tracer().start_as_current_span("research_grade") as span:
+        span.set_attribute("retrieval.doc_count", len(state.get("retrieved_docs", [])))
+        result = await grade_documents(state)
+        span.set_attribute("grade.docs_relevant", result.get("docs_relevant", "unknown"))
+        set_span_ok(span)
+        return result
 
 
 async def _rewrite_node(state: ResearchState) -> dict:
@@ -80,8 +88,9 @@ async def _rewrite_node(state: ResearchState) -> dict:
     Uses the same DummyLLM-compatible rewrite approach as simple_workflow:
     DummyLLM appends 'rewritten:' prefix; real LLM reformulates.
     """
-    with get_tracer().start_as_current_span("research_rewrite"):
+    with get_tracer().start_as_current_span("research_rewrite") as span:
         query = state["query"]
+        span.set_attribute("rewrite.iteration", state.get("rewrite_count", 0) + 1)
         llm = get_llm()
 
         if isinstance(llm, DummyLLM):
@@ -96,6 +105,7 @@ async def _rewrite_node(state: ResearchState) -> dict:
             new_query = response.content.strip() or query
 
         rewrite_count = state.get("rewrite_count", 0) + 1
+        set_span_ok(span)
         logger.info(
             "research_subgraph_rewrite",
             original=query[:80],
@@ -122,9 +132,10 @@ async def _synthesize_node(state: ResearchState) -> dict:
     For DummyLLM: returns a concatenation of doc contents.
     For real LLM: would produce a synthesis paragraph (future extension).
     """
-    with get_tracer().start_as_current_span("research_synthesize"):
+    with get_tracer().start_as_current_span("research_synthesize") as span:
         docs = state.get("retrieved_docs", [])
         doc_count = len(docs)
+        span.set_attribute("retrieval.doc_count", doc_count)
 
         # Build a summary from retrieved docs
         if docs:
@@ -135,6 +146,8 @@ async def _synthesize_node(state: ResearchState) -> dict:
         else:
             summary = "No relevant documents found."
 
+        span.set_attribute("synthesis.output_length", len(summary))
+        set_span_ok(span)
         logger.info("research_subgraph_synthesize", doc_count=doc_count)
         return {
             "agent_trace": [

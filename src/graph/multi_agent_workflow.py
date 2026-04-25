@@ -59,7 +59,13 @@ from src.graph.simple_workflow import (
     sanitize_input,
 )
 from src.graph.state import AgentState
-from src.observability.tracing import get_tracer
+from src.observability.tracing import (
+    attach_context,
+    detach_context,
+    get_current_context,
+    get_tracer,
+    set_span_ok,
+)
 
 logger = structlog.get_logger()
 
@@ -100,8 +106,17 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
     Instrumented with an OTel child span named 'supervisor_node'.
     """
-    with get_tracer().start_as_current_span("supervisor_node"):
+    with get_tracer().start_as_current_span("supervisor_node") as span:
+        query = state.get("query", "")
+        span.set_attribute("rag.query", query[:100])
+        span.set_attribute("agent.iteration_count", state.get("iteration_count", 0))
         decision = await _supervisor.decide(state)
+        span.set_attribute(
+            "agent.decision",
+            decision.get("next_agent") or ",".join(decision.get("next_agents", [])),
+        )
+        span.set_attribute("agent.reasoning", decision.get("reasoning", "")[:200])
+        set_span_ok(span)
         return {
             "supervisor_decision": decision,
             "agent_trace": [{"node": "supervisor", "decision": decision}],
@@ -110,42 +125,60 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
 async def research_agent_node(state: SupervisorState) -> dict:
     """LangGraph node: run the research subgraph (retrieve → grade → rewrite loop → synthesize)."""
-    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
+    with get_tracer().start_as_current_span("research_agent_node") as span:
+        span.set_attribute("rag.query", state.get("query", "")[:100])
+        span.set_attribute("agent.name", "research")
+        span.set_attribute("agent.iteration_count", state.get("iteration_count", 0))
+        await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
 
-    # Map outer state → subgraph state, run subgraph, map results back
-    research_state = to_research_state(state)
-    result = await research_compiled.ainvoke(research_state)
-    outer_result = from_research_state(result)
+        research_state = to_research_state(state)
+        result = await research_compiled.ainvoke(research_state)
+        outer_result = from_research_state(result)
 
-    _record_agent_cost(model_id="gpt-4o-mini", input_t=300, output_t=200, state=state)
-    return {
-        **outer_result,
-        "iteration_count": state.get("iteration_count", 0) + 1,
-    }
+        span.set_attribute("retrieval.doc_count", len(outer_result.get("retrieved_docs", [])))
+        _record_agent_cost(model_id="gpt-4o-mini", input_t=300, output_t=200, state=state)
+        set_span_ok(span)
+        return {
+            **outer_result,
+            "iteration_count": state.get("iteration_count", 0) + 1,
+        }
 
 
 async def analysis_agent_node(state: SupervisorState) -> dict:
     """LangGraph node: delegate to AnalysisAgent and record the dispatch."""
-    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
-    result = await AnalysisAgent().execute(state)
-    _record_agent_cost(model_id="gpt-4o-mini", input_t=400, output_t=300, state=state)
-    return {
-        **result,
-        "agents_called": ["analysis"],
-        "iteration_count": state.get("iteration_count", 0) + 1,
-    }
+    with get_tracer().start_as_current_span("analysis_agent_node") as span:
+        span.set_attribute("rag.query", state.get("query", "")[:100])
+        span.set_attribute("agent.name", "analysis")
+        span.set_attribute("agent.iteration_count", state.get("iteration_count", 0))
+        await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
+        result = await AnalysisAgent().execute(state)
+        _record_agent_cost(model_id="gpt-4o-mini", input_t=400, output_t=300, state=state)
+        set_span_ok(span)
+        return {
+            **result,
+            "agents_called": ["analysis"],
+            "iteration_count": state.get("iteration_count", 0) + 1,
+        }
 
 
 async def quality_agent_node(state: SupervisorState) -> dict:
     """LangGraph node: delegate to QualityAgent and record the dispatch."""
-    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 200)
-    result = await QualityAgent().execute(state)
-    _record_agent_cost(model_id="gpt-4o-mini", input_t=200, output_t=100, state=state)
-    return {
-        **result,
-        "agents_called": ["quality"],
-        "iteration_count": state.get("iteration_count", 0) + 1,
-    }
+    with get_tracer().start_as_current_span("quality_agent_node") as span:
+        span.set_attribute("rag.query", state.get("query", "")[:100])
+        span.set_attribute("agent.name", "quality")
+        span.set_attribute("agent.iteration_count", state.get("iteration_count", 0))
+        await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 200)
+        result = await QualityAgent().execute(state)
+        quality = result.get("answer_quality")
+        if quality is not None:
+            span.set_attribute("quality.score", float(quality))
+        _record_agent_cost(model_id="gpt-4o-mini", input_t=200, output_t=100, state=state)
+        set_span_ok(span)
+        return {
+            **result,
+            "agents_called": ["quality"],
+            "iteration_count": state.get("iteration_count", 0) + 1,
+        }
 
 
 async def parallel_dispatch_node(state: SupervisorState) -> dict:
@@ -160,82 +193,104 @@ async def parallel_dispatch_node(state: SupervisorState) -> dict:
     asyncio.gather lets us merge results in application code without
     restructuring the entire state schema.
     """
-    decision = state.get("supervisor_decision") or {}
-    next_agents = decision.get("next_agents", [])
+    with get_tracer().start_as_current_span("parallel_dispatch_node") as span:
+        decision = state.get("supervisor_decision") or {}
+        next_agents = decision.get("next_agents", [])
+        span.set_attribute("rag.query", state.get("query", "")[:100])
+        span.set_attribute("parallel.agents", ",".join(next_agents))
 
-    agent_map = {
-        "research": _run_research,
-        "analysis": _run_analysis,
-    }
+        agent_map = {
+            "research": _run_research,
+            "analysis": _run_analysis,
+        }
 
-    tasks = []
-    for agent_name in next_agents:
-        runner = agent_map.get(agent_name)
-        if runner:
-            tasks.append(runner(state))
+        # Capture parent context so child tasks inherit the trace
+        parent_ctx = get_current_context()
 
-    if not tasks:
-        logger.warning("parallel_dispatch_no_valid_agents", next_agents=next_agents)
-        return {"agent_trace": [{"node": "parallel_dispatch", "agents": []}]}
+        tasks = []
+        for agent_name in next_agents:
+            runner = agent_map.get(agent_name)
+            if runner:
+                tasks.append(runner(state, parent_ctx=parent_ctx))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        if not tasks:
+            logger.warning("parallel_dispatch_no_valid_agents", next_agents=next_agents)
+            return {"agent_trace": [{"node": "parallel_dispatch", "agents": []}]}
 
-    # Merge results: combine all agent outputs
-    merged: dict = {
-        "agents_called": [],
-        "agent_trace": [{"node": "parallel_dispatch", "agents": list(next_agents)}],
-    }
-    iteration_increment = 0
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            agent_name = next_agents[i] if i < len(next_agents) else "unknown"
-            logger.warning("parallel_agent_failed", agent=agent_name, error=str(result))
-            continue
-        # Merge state fields — later agents override earlier ones for scalar fields
-        for key, value in result.items():
-            if key == "agents_called":
-                merged["agents_called"].extend(value)
-            elif key == "agent_trace":
-                merged["agent_trace"].extend(value)
-            elif key == "iteration_count":
-                iteration_increment += 1
-            else:
-                merged[key] = value
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # One supervisor decision → one iteration, regardless of how many agents ran
-    merged["iteration_count"] = state.get("iteration_count", 0) + 1
+        # Merge results: combine all agent outputs
+        merged: dict = {
+            "agents_called": [],
+            "agent_trace": [{"node": "parallel_dispatch", "agents": list(next_agents)}],
+        }
+        succeeded = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                agent_name = next_agents[i] if i < len(next_agents) else "unknown"
+                logger.warning("parallel_agent_failed", agent=agent_name, error=str(result))
+                continue
+            succeeded.append(next_agents[i] if i < len(next_agents) else "unknown")
+            for key, value in result.items():
+                if key == "agents_called":
+                    merged["agents_called"].extend(value)
+                elif key == "agent_trace":
+                    merged["agent_trace"].extend(value)
+                elif key == "iteration_count":
+                    pass  # handled below
+                else:
+                    merged[key] = value
 
-    logger.info(
-        "parallel_dispatch_complete",
-        agents_dispatched=next_agents,
-        agents_succeeded=[
-            next_agents[i]
-            for i, r in enumerate(results)
-            if not isinstance(r, Exception) and i < len(next_agents)
-        ],
-    )
-    return merged
+        merged["iteration_count"] = state.get("iteration_count", 0) + 1
+        span.set_attribute("parallel.succeeded", ",".join(succeeded))
+        set_span_ok(span)
 
-
-async def _run_research(state: SupervisorState) -> dict:
-    """Run research subgraph (for parallel dispatch)."""
-    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
-    research_state = to_research_state(state)
-    result = await research_compiled.ainvoke(research_state)
-    outer_result = from_research_state(result)
-    _record_agent_cost(model_id="gpt-4o-mini", input_t=300, output_t=200, state=state)
-    return outer_result
+        logger.info(
+            "parallel_dispatch_complete",
+            agents_dispatched=next_agents,
+            agents_succeeded=succeeded,
+        )
+        return merged
 
 
-async def _run_analysis(state: SupervisorState) -> dict:
-    """Run analysis agent (for parallel dispatch)."""
-    await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
-    result = await AnalysisAgent().execute(state)
-    _record_agent_cost(model_id="gpt-4o-mini", input_t=400, output_t=300, state=state)
-    return {
-        **result,
-        "agents_called": ["analysis"],
-    }
+async def _run_research(
+    state: SupervisorState, *, parent_ctx: object = None
+) -> dict:
+    """Run research subgraph (for parallel dispatch) with context propagation."""
+    token = attach_context(parent_ctx)
+    try:
+        with get_tracer().start_as_current_span("parallel_research") as span:
+            span.set_attribute("agent.name", "research")
+            await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
+            research_state = to_research_state(state)
+            result = await research_compiled.ainvoke(research_state)
+            outer_result = from_research_state(result)
+            span.set_attribute("retrieval.doc_count", len(outer_result.get("retrieved_docs", [])))
+            _record_agent_cost(model_id="gpt-4o-mini", input_t=300, output_t=200, state=state)
+            set_span_ok(span)
+            return outer_result
+    finally:
+        detach_context(token)
+
+
+async def _run_analysis(
+    state: SupervisorState, *, parent_ctx: object = None
+) -> dict:
+    """Run analysis agent (for parallel dispatch) with context propagation."""
+    token = attach_context(parent_ctx)
+    try:
+        with get_tracer().start_as_current_span("parallel_analysis") as span:
+            span.set_attribute("agent.name", "analysis")
+            await get_default_rate_limiter().wait_for_capacity("gpt-4o-mini", 500)
+            result = await AnalysisAgent().execute(state)
+            _record_agent_cost(model_id="gpt-4o-mini", input_t=400, output_t=300, state=state)
+            set_span_ok(span)
+            return {
+                **result,
+                "agents_called": ["analysis"],
+            }
+    finally:
+        detach_context(token)
 
 
 def _record_agent_cost(
@@ -268,34 +323,40 @@ async def human_review(state: SupervisorState) -> dict:
     """
     from src.api.human_review import submit_for_review
 
-    quality = state.get("answer_quality", 0.0)
-    query = state.get("query", "")
-    answer = state.get("generation", "") or state.get("final_answer", "")
+    with get_tracer().start_as_current_span("human_review_node") as span:
+        quality = state.get("answer_quality", 0.0)
+        query = state.get("query", "")
+        answer = state.get("generation", "") or state.get("final_answer", "")
+        span.set_attribute("rag.query", query[:100])
+        span.set_attribute("quality.score", float(quality) if quality else 0.0)
 
-    review_id = submit_for_review(
-        query=query,
-        answer=answer,
-        confidence=float(quality) if quality else 0.0,
-        reason=f"quality_agent score {quality:.2f} below threshold 0.70",
-    )
+        review_id = submit_for_review(
+            query=query,
+            answer=answer,
+            confidence=float(quality) if quality else 0.0,
+            reason=f"quality_agent score {quality:.2f} below threshold 0.70",
+        )
 
-    logger.info(
-        "human_review_submitted",
-        review_id=review_id,
-        answer_quality=quality,
-        query=query[:80],
-    )
-    return {
-        "final_answer": f"Answer pending human review (ID: {review_id})",
-        "agent_trace": [
-            {
-                "node": "human_review",
-                "quality": quality,
-                "review_id": review_id,
-                "status": "submitted",
-            }
-        ],
-    }
+        span.set_attribute("review.id", review_id)
+        set_span_ok(span)
+
+        logger.info(
+            "human_review_submitted",
+            review_id=review_id,
+            answer_quality=quality,
+            query=query[:80],
+        )
+        return {
+            "final_answer": f"Answer pending human review (ID: {review_id})",
+            "agent_trace": [
+                {
+                    "node": "human_review",
+                    "quality": quality,
+                    "review_id": review_id,
+                    "status": "submitted",
+                }
+            ],
+        }
 
 
 # ── Routing ────────────────────────────────────────────────────────────────────
