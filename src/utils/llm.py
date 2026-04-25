@@ -14,7 +14,15 @@ import structlog
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_random
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random,
+)
+
+from src.observability.tracing import get_tracer, set_span_ok
 
 logger = structlog.get_logger()
 
@@ -84,8 +92,13 @@ class DummyLLM(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
-        message = AIMessage(content=self.default_response)
-        return ChatResult(generations=[ChatGeneration(message=message)])
+        with get_tracer().start_as_current_span("llm_call") as span:
+            span.set_attribute("llm.model", self.model_name)
+            span.set_attribute("llm.input_messages", len(messages))
+            message = AIMessage(content=self.default_response)
+            span.set_attribute("llm.output_tokens_est", len(self.default_response.split()))
+            set_span_ok(span)
+            return ChatResult(generations=[ChatGeneration(message=message)])
 
     async def _agenerate(
         self,

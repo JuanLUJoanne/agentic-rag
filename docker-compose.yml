@@ -9,6 +9,8 @@ services:
       - NEO4J_URI=bolt://neo4j:7687
       - EMBEDDING_CACHE_DB=/app/data/embedding_cache.db
       - QUERY_MEMORY_DB=/app/data/query_memory.db
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=agentic-rag
     volumes:
       - appdata:/app/data
     depends_on:
@@ -49,6 +51,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
 
 volumes:
   postgres_data:

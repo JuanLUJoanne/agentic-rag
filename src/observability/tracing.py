@@ -26,10 +26,16 @@ logger = structlog.get_logger()
 # Optional import guard
 # ---------------------------------------------------------------------------
 try:
+    from opentelemetry import context as otel_context
     from opentelemetry import trace as _otel_trace
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor,
+        ConsoleSpanExporter,
+        SimpleSpanProcessor,
+    )
+    from opentelemetry.trace import StatusCode
 
     _OTEL_AVAILABLE = True
 except ModuleNotFoundError:
@@ -52,6 +58,12 @@ class _NoOpSpan:
     def set_status(self, *args: object, **kwargs: object) -> None:
         pass
 
+    def __enter__(self) -> _NoOpSpan:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
 
 class _NoOpTracer:
     """Tracer that produces no spans and incurs no overhead."""
@@ -67,16 +79,17 @@ class _NoOpTracer:
 _tracer: object = None  # real Tracer or _NoOpTracer
 
 
-def setup_tracing(service_name: str) -> object:
+def setup_tracing(service_name: str | None = None) -> object:
     """
     Configure and register a TracerProvider.
 
     Returns a real ``TracerProvider`` when opentelemetry-sdk is installed;
     otherwise logs a warning and returns ``None``.
 
-    If OTEL_EXPORTER_OTLP_ENDPOINT is set, export spans via OTLP/gRPC;
-    otherwise fall back to ConsoleSpanExporter so the app runs without
-    a collector.
+    Config via environment:
+      - OTEL_SERVICE_NAME (fallback: *service_name* arg, then "agentic-rag")
+      - OTEL_EXPORTER_OTLP_ENDPOINT → use OTLP/gRPC exporter
+      - OTEL_DEV_MODE=true → SimpleSpanProcessor (flush-on-end, good for dev)
     """
     if not _OTEL_AVAILABLE:
         logger.warning(
@@ -85,8 +98,11 @@ def setup_tracing(service_name: str) -> object:
         )
         return None
 
-    resource = Resource.create({"service.name": service_name})
+    svc = os.environ.get("OTEL_SERVICE_NAME") or service_name or "agentic-rag"
+    resource = Resource.create({"service.name": svc})
     provider = TracerProvider(resource=resource)
+
+    dev_mode = os.environ.get("OTEL_DEV_MODE", "").lower() in ("1", "true", "yes")
 
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
     if endpoint:
@@ -104,7 +120,8 @@ def setup_tracing(service_name: str) -> object:
         logger.info("tracing_console_exporter", reason="OTEL_EXPORTER_OTLP_ENDPOINT not set")
         exporter = ConsoleSpanExporter()
 
-    provider.add_span_processor(BatchSpanProcessor(exporter))
+    processor = SimpleSpanProcessor(exporter) if dev_mode else BatchSpanProcessor(exporter)
+    provider.add_span_processor(processor)
     _otel_trace.set_tracer_provider(provider)
 
     global _tracer
@@ -126,3 +143,44 @@ def get_tracer() -> object:
         else:
             _tracer = _NoOpTracer()
     return _tracer
+
+
+def get_current_context() -> object | None:
+    """Return the current OTel context for propagation across async boundaries.
+
+    Returns ``None`` when opentelemetry is not installed.
+    """
+    if not _OTEL_AVAILABLE:
+        return None
+    return otel_context.get_current()
+
+
+def attach_context(ctx: object) -> object | None:
+    """Attach an OTel context (e.g. in a child asyncio task).
+
+    Returns a token to pass to :func:`detach_context`, or ``None`` when
+    opentelemetry is not installed.
+    """
+    if not _OTEL_AVAILABLE or ctx is None:
+        return None
+    return otel_context.attach(ctx)  # type: ignore[arg-type]
+
+
+def detach_context(token: object) -> None:
+    """Detach a previously attached context."""
+    if not _OTEL_AVAILABLE or token is None:
+        return
+    otel_context.detach(token)  # type: ignore[arg-type]
+
+
+def set_span_ok(span: object) -> None:
+    """Mark a span as OK (no-op when OTel is not installed)."""
+    if _OTEL_AVAILABLE and hasattr(span, "set_status"):
+        span.set_status(StatusCode.OK)  # type: ignore[attr-defined]
+
+
+def set_span_error(span: object, exc: BaseException) -> None:
+    """Record an exception and mark a span as ERROR."""
+    if _OTEL_AVAILABLE and hasattr(span, "set_status"):
+        span.record_exception(exc)  # type: ignore[attr-defined]
+        span.set_status(StatusCode.ERROR, str(exc))  # type: ignore[attr-defined]
