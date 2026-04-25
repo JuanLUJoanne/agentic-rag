@@ -414,7 +414,7 @@ src/
 │                    #   + circuit breakers), cache, semantic cache, memory
 └── utils/           # LLM factory (DummyLLM ↔ OpenAI, exponential backoff)
 tests/
-└── unit/            # 387 tests, all runnable offline
+└── unit/            # 404 tests, all runnable offline
 scripts/
 └── demo.py          # End-to-end demo: 5 queries × 10 patterns
 ```
@@ -442,7 +442,7 @@ scripts/
 | Persistence | SQLite (cache, memory, prompt store, audit) |
 | Multi-tenancy | Per-tenant token bucket rate limiter + cost budget |
 | Experimentation | A/B testing framework (deterministic sha256 assignment) |
-| Testing | pytest + pytest-asyncio (387 tests, all runnable offline) |
+| Testing | pytest + pytest-asyncio (404 tests, all runnable offline) |
 | Linting | ruff |
 | CI | GitHub Actions (Python 3.11/3.12 matrix) |
 | Container | Docker + docker-compose (PostgreSQL, Neo4j, API) |
