@@ -241,6 +241,14 @@ async def costs_endpoint() -> dict:
     }
 
 
+@app.get("/gateway/stats")
+async def gateway_stats_endpoint() -> dict:
+    """Return LLM gateway statistics: requests, latency, cost, circuit breakers."""
+    from src.gateway.llm_gateway import get_gateway
+
+    return get_gateway().stats()
+
+
 @app.get("/eval/drift")
 async def eval_drift_endpoint() -> dict:
     """
